@@ -63,20 +63,9 @@ All training and test data involved in the experiments are publicly available da
 
 * The 3D denoising/isotropic reconstruction/projection datasets can be downloaded from `https://publications.mpi-cbg.de/publications-sites/7207/`
 
-train: /mnt/home/user1/MCX/Medical/CSBDeep-master/DataSet/
-[Denoising_Planaria][Denoising_Tribolium][Isotropic/Isotropic_Liver][Projection_Flywing]/train_data
-test: /mnt/home/user1/MCX/Medical/CSBDeep-master/DataSet/
-[Denoising_Planaria][Denoising_Tribolium][Isotropic/Isotropic_Liver][Projection_Flywing]/test_data
-
 * The SR dataset can be downloaded from `https://doi.org/10.6084/m9.figshare.13264793`
 
-train: /mnt/home/user1/MCX/Medical/CSBDeep-master/DataSet/BioSR_WF_to_SIM/DL-SR-main/dataset/train
-test: /mnt/home/user1/MCX/Medical/CSBDeep-master/DataSet/BioSR_WF_to_SIM/DL-SR-main/dataset/test
-
 * The Volumetric reconstruction dataset can be downloaded from `https://doi.org/10.5281/zenodo.4390067`
-
-train: /mnt/home/user1/MCX/Medical/VCD-Net-main/vcdnet/vcd-example-data/data/train
-test: /mnt/home/user1/MCX/Medical/VCD-Net-main/vcdnet/vcd-example-data/data/to_predict
 
 ### Model
 The pretrained models can be downloaded from `https://pan.baidu.com/`
