@@ -1,14 +1,29 @@
-# -----------------------------------------------------------------------------------
-# SwinIR: Image Restoration Using Swin Transformer, https://arxiv.org/abs/2108.10257
-# Originally Written by Ze Liu, Modified by Jingyun Liang.
-# -----------------------------------------------------------------------------------
-
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from model.enlcn import ENLCN
+
+
+def make_model(args):
+    try:
+        inch = int(args.inputchannel)
+    except:
+        inch = 1
+    return swinir(upscale=int(args.scale[0]), in_chans=inch)
+
+
+def make_modelproj(args):
+    args.n_resblocks = 64
+    args.n_feats = 256
+    return swinirProj_stage2(upscale=int(args.scale[0]), out_chans=1, args=args)
+    # return swinirProj_stage2(upscale=int(args.scale[0]), in_chans=50, out_chans=1, args=args)
+
+
+def make_model2t3(args):
+    return swinir2dto3d(upscale=11, in_chans=121, out_chans=61)
 
 
 class swinir(nn.Module):
@@ -22,6 +37,7 @@ class swinir(nn.Module):
         num_in_ch = in_chans
         num_out_ch = out_chans
         
+        self.precision = torch.float32
         self.img_range = img_range
         self.mean = torch.zeros(1, 1, 1, 1)
         self.upscale = upscale
@@ -126,6 +142,11 @@ class swinir(nn.Module):
         x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
         return x
     
+    def half(self):
+        self.precision = torch.half
+        print('half')
+        super().half()
+    
     def forward_features(self, x):
         x_size = (x.shape[2], x.shape[3])
         x = self.patch_embed(x)
@@ -142,6 +163,9 @@ class swinir(nn.Module):
         return x
     
     def forward(self, x):
+        if self.precision == torch.half:
+            x = x.half()
+
         H, W = x.shape[2:]
         x = self.check_image_size(x)
         self.mean = self.mean.type_as(x)
@@ -171,6 +195,165 @@ class swinir(nn.Module):
     #             if isinstance(param, nn.Parameter):
     #                 param = param.data
     #             own_state[name].copy_(param)
+
+
+################################## Projection ##############################
+class swinirProj_stage2(nn.Module):
+    def __init__(self, img_size=64, patch_size=1, out_chans=1,
+                 embed_dim=180 // 2, depths=[6, 6, 6], num_heads=[6, 6, 6],
+                 window_size=8, mlp_ratio=2., qkv_bias=True, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
+                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
+                 use_checkpoint=False, upscale=2, img_range=1., num_feat=32, args=None):
+        super(swinirProj_stage2, self).__init__()
+        
+        self.project = ENLCN(args=args)
+        self.denoise = swinir(img_size, patch_size, 1, out_chans,
+                              embed_dim, depths, num_heads, window_size, mlp_ratio, qkv_bias, qk_scale,
+                              drop_rate, attn_drop_rate, drop_path_rate, norm_layer, ape, patch_norm, use_checkpoint,
+                              upscale, img_range, num_feat)
+        
+    def half(self):
+        self.denoise.half()
+
+    def forward(self, x):
+        if self.training:  #
+            x2d, closs = self.project(x)
+            x = self.denoise(x2d) + x2d
+            return x2d, x, closs
+        else:
+            x2d = self.project(x)
+            x = self.denoise(x2d) + x2d
+            return x2d, x
+
+
+################################## volumetric reconstruction ##############################
+
+
+class swinir2dto3d(nn.Module):
+    def __init__(self, img_size=64, patch_size=1, in_chans=121, out_chans=61,
+                 embed_dim=180 // 2, depths=[6, 6, 6], num_heads=[6, 6, 6],
+                 window_size=8, mlp_ratio=2., qkv_bias=True, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
+                 norm_layer=nn.LayerNorm, patch_norm=True,
+                 use_checkpoint=False, upscale=2, img_range=1., num_feat=32):
+        super(swinir2dto3d, self).__init__()
+
+        self.precision = torch.float32
+        self.img_range = img_range
+        self.mean = torch.zeros(1, 1, 1, 1)
+        self.upscale = upscale
+        self.window_size = window_size
+        
+        #####################################################################################################
+        ################################### 1, shallow feature extraction ###################################
+        self.conv_first0 = UNetA(in_chans, out_chans)
+        self.conv_first = nn.Conv2d(out_chans, embed_dim, 3, 1, 1)
+        
+        #####################################################################################################
+        ################################### 2, deep feature extraction ######################################
+        # split image into non-overlapping patches
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=embed_dim, embed_dim=embed_dim,
+            norm_layer=norm_layer if patch_norm else None)
+        patches_resolution = self.patch_embed.patches_resolution
+        self.patches_resolution = patches_resolution
+        
+        # merge non-overlapping patches into image
+        self.patch_unembed = PatchUnEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=embed_dim, embed_dim=embed_dim,
+            norm_layer=norm_layer if patch_norm else None)
+        self.pos_drop = nn.Dropout(p=drop_rate)
+        
+        # stochastic depth
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+        
+        self.layers = nn.ModuleList()
+        for i_layer in range(len(depths)):
+            layer = RSTB(dim=embed_dim,
+                         input_resolution=(patches_resolution[0],
+                                           patches_resolution[1]),
+                         depth=depths[i_layer],
+                         num_heads=num_heads[i_layer],
+                         window_size=window_size,
+                         mlp_ratio=mlp_ratio,
+                         qkv_bias=qkv_bias, qk_scale=qk_scale,
+                         drop=drop_rate, attn_drop=attn_drop_rate,
+                         drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],  # no impact on SR results
+                         norm_layer=norm_layer,
+                         downsample=None,
+                         use_checkpoint=use_checkpoint,
+                         img_size=img_size,
+                         patch_size=patch_size,
+                         resi_connection='1conv'
+                         )
+            self.layers.append(layer)
+        self.norm = norm_layer(embed_dim)
+        
+        # build the last conv layer in deep feature extraction
+        self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
+        
+        #####################################################################################################
+        ################################ 3, high quality image reconstruction ################################
+        self.conv_before_upsample = nn.Sequential(nn.Conv2d(embed_dim, embed_dim, 3, 1, 1),
+                                                  nn.LeakyReLU(inplace=True))
+        self.conv_last = nn.Conv2d(embed_dim, out_chans, 3, 1, 1)
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+    
+    def check_image_size(self, x):
+        _, _, h, w = x.size()
+        mod_pad_h = (self.window_size - h % self.window_size) % self.window_size
+        mod_pad_w = (self.window_size - w % self.window_size) % self.window_size
+        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
+        return x
+    
+    def forward_features(self, x):
+        x_size = (x.shape[2], x.shape[3])
+        x = self.patch_embed(x)
+        
+        x = self.pos_drop(x)
+        
+        for layer in self.layers:
+            x = layer(x, x_size)
+        
+        x = self.norm(x)  # B L C
+        x = self.patch_unembed(x, x_size)
+        
+        return x
+    
+    def half(self):
+        self.precision = torch.half
+        print('half')
+        super().half()
+    
+    def forward(self, x):
+        if self.precision == torch.half:
+            x = x.half()
+
+        x = self.check_image_size(x)
+        self.mean = self.mean.type_as(x)
+        x = (x - self.mean) * self.img_range
+        
+        xunet = self.conv_first0(x)
+        x = self.conv_first(xunet)
+        x = self.conv_after_body(self.forward_features(x))  # + x
+        x = self.conv_before_upsample(x)
+        x = self.conv_last(x)
+        x = x / self.img_range + self.mean
+        
+        return xunet, x
+
+
+################################## SwinIR Blocks #############################
 
 
 class Mlp(nn.Module):
@@ -396,7 +579,7 @@ class SwinTransformerBlock(nn.Module):
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
         attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
 
-        return attn_mask
+        return attn_mask.to(self.mlp.fc1.weight.dtype)
 
     def forward(self, x, x_size):
         H, W = x_size
@@ -773,18 +956,16 @@ class UNetA(nn.Module):
         n_interp = 4
         channels_interp = 128
         self.conv2d = nn.Conv2d(num_in_ch, channels_interp, 7, 1, 3)
-
+        
         ## Up-scale input
         self.layers = nn.ModuleList()
         for i_layer in range(n_interp):
             channels_interp = channels_interp // 2
-            # [1,118,118,32] [1,236,236,16] [1,472,472,8] [1,944,944,4]
-            # [1,118,118,64] [1,236,236,32] [1,472,472,16] [1,944,944,8]
-            self.layers.append(nn.Sequential(Upsample2(channels_interp//2),
-                                nn.Conv2d(channels_interp//(2), channels_interp, 3, 1, 1)))
+            self.layers.append(nn.Sequential(Upsample2(channels_interp // 2),
+                                             nn.Conv2d(channels_interp // 2, channels_interp, 3, 1, 1)))
         self.conv2d1 = nn.Sequential(nn.Conv2d(channels_interp, channels_interp, 3, 1, 1),
                                      nn.BatchNorm2d(num_features=channels_interp), nn.ReLU(inplace=True))
-
+        
         pyramid_channels = [128, 256, 512, 512, 512]
         inch = 64
         self.conv2d2 = nn.Sequential(nn.Conv2d(channels_interp, inch, 3, 1, 1),  # 64
@@ -795,7 +976,7 @@ class UNetA(nn.Module):
             layers = nn.Sequential(nn.Conv2d(inch, nc, 3, 1, 1), nn.BatchNorm2d(num_features=nc), nn.ReLU(inplace=True))
             inch = nc
             self.encoder_layers.append(layers)
-
+        
         # decoder
         nl = len(self.encoder_layers)  # [1,944,944,64]~ [1,59,59,512]
         self.decoder_layers = nn.ModuleList()
@@ -810,7 +991,7 @@ class UNetA(nn.Module):
                                    nn.ReLU(inplace=True),
                                    nn.BatchNorm2d(out_channels))
             self.decoder_layers.append(layers)
-
+        
         self.apply(self._init_weights)
     
     def _init_weights(self, m):
@@ -821,25 +1002,22 @@ class UNetA(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-  
+    
     def forward(self, x):
         H, W = x.shape[2:]
         
-        x = self.conv2d(x)  # [2,121,16,16]
-        
+        x = self.conv2d(x)
         ## Up-scale input
         for layer in self.layers:
-            # print(x.size())  # ([2, 128, 16, 16])([2, 64, 32, 32])([2, 32, 64, 64])([2, 16, 128, 128])
             x = layer(x)
         x = self.conv2d1(x)
-
+        
         encoder_layers = []
         # 'encoder':
         x = self.conv2d2(x)  # [1,944,944,64]
         id0 = 0
         for layer in self.encoder_layers:
             encoder_layers.append(x)  # append n0, n1, n2, n3, n4 (but without n5)to the layers list
-            # print('encoder ', x.size()) # [2, 64, 256, 256]([2, 128, 127, 127])([2, 256, 63, 63])([2, 512, 31, 31])([2, 512, 15, 15])
             x = layer(x)
             y = torch.zeros_like(x)
             # new_channels = pyramid_channels[id0] - x.shape[1]
@@ -847,105 +1025,20 @@ class UNetA(nn.Module):
             # n1 = torch.concat([x, y], dim=1)
             id0 += 1
             x = nn.MaxPool2d(kernel_size=3, stride=2)(x + y)  # [1,30,30,512]
-
+        
         # decoder # [1,944,944,64]~ [1,59,59,512]
         x = F.interpolate(x, size=(encoder_layers[-1].shape[2:]), mode='bilinear')  # [1,59,59,512]
         idx = 4
         for layer in self.decoder_layers:  # idx = 4,3,2,1,0
             if idx > 0:
-                H0, W0 = encoder_layers[idx-1].shape[2:]  # x.shape[2:]
+                H0, W0 = encoder_layers[idx - 1].shape[2:]  # x.shape[2:]
             else:
                 H0, W0 = H * self.upscale, W * self.upscale
-            # print('decoder ', x.size())  # [2, 64, 256, 256]([2, 128, 127, 127])([2, 256, 63, 63])([2, 512, 31, 31])([2, 512, 15, 15])
             x = torch.concat([encoder_layers[idx], x], dim=1)
             x = layer(x)  # n [1,944,944,61]
             x = F.interpolate(x, size=(H0, W0), mode='bilinear')
             idx -= 1
-
-        x = F.interpolate(x, size=(H*self.upscale, W*self.upscale), mode='bilinear')
+        
+        x = F.interpolate(x, size=(H * self.upscale, W * self.upscale), mode='bilinear')
         x = torch.tanh(x)
         return x
-
-
-import model.attention as attention
-import model.common as common
-
-
-class Projhead(nn.Module):
-    def __init__(self, args, conv=common.default_conv):
-        super(Projhead, self).__init__()
-        
-        n_resblock = args.n_resblocks
-        inch = args.inch
-        outch = args.n_colors
-        n_feats = args.n_feats
-        kernel_size = 3
-        scale = args.scale[0]
-        act = nn.ReLU(True)
-        
-        self.sub_mean = common.MeanShiftC1(args.rgb_range)
-        self.add_mean = common.MeanShiftC1(args.rgb_range, sign=1)
-        m_head = [conv(inch, n_feats, kernel_size)]
-        
-        m_body = [attention.ENLCA(
-            channel=n_feats, reduction=4,
-            res_scale=args.res_scale)]
-        for i in range(n_resblock):
-            m_body.append(common.ResBlock(
-                conv, n_feats, kernel_size, act=act, res_scale=args.res_scale
-            ))
-            if (i + 1) % 8 == 0:
-                m_body.append(attention.ENLCA(
-                    channel=n_feats, reduction=4,
-                    res_scale=args.res_scale))
-        m_body.append(conv(n_feats, n_feats, kernel_size))
-        
-        # define tail module
-        m_tail = [
-            common.Upsampler(conv, scale, n_feats, act=False),
-            nn.Conv2d(
-                n_feats, outch, kernel_size,
-                padding=(kernel_size // 2)
-            )
-        ]
-        
-        self.head = nn.Sequential(*m_head)
-        self.body = nn.ModuleList(m_body)
-        self.tl = nn.Sequential(*m_tail)
-    
-    def forward(self, x):
-        # x = self.sub_mean(x)
-        x = self.head(x)
-        res = x
-        comparative_loss = []
-        for i in range(len(self.body)):
-            if i % 9 == 0:
-                res, loss = self.body[i](res)
-                comparative_loss.append(loss)
-            else:
-                res = self.body[i](res)
-        res += x
-        
-        x = self.tl(res)
-        # x = self.add_mean(x)
-        
-        return x, comparative_loss
-    
-    def load_state_dict(self, state_dict, strict=True):
-        own_state = self.state_dict()
-        for name, param in state_dict.items():
-            if name in own_state:
-                if isinstance(param, nn.Parameter):
-                    param = param.data
-                try:
-                    own_state[name].copy_(param)
-                except Exception:
-                    if name.find('tail') == -1:
-                        raise RuntimeError('While copying the parameter named {}, '
-                                           'whose dimensions in the model are {} and '
-                                           'whose dimensions in the checkpoint are {}.'
-                                           .format(name, own_state[name].size(), param.size()))
-            elif strict:
-                if name.find('tail') == -1:
-                    raise KeyError('unexpected key "{}" in state_dict'
-                                   .format(name))

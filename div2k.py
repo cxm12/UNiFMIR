@@ -1,4 +1,3 @@
-import imageio
 import glob
 import torch.utils.data as data
 from PIL import Image
@@ -7,102 +6,14 @@ import sys
 import os
 import numpy as np
 from tifffile import imread
-from scipy.ndimage.interpolation import zoom
-
 sys.path.append('..')
 from csbdeep.utils import normalize, axes_dict, axes_check_and_normalize, backend_channels_last, move_channel_for_backend
+from csbdeep.io import load_training_data
 
+CSB_path = '/home/user2/dataset/microscope/CSB'
+VCD_path = '/home/user2/dataset/microscope/VCD'
 
 datamin, datamax = 0, 100  #
-
-
-def load_training_data(file, validation_split=0, axes=None, n_images=None, verbose=False):
-    """Load training data from file in ``.npz`` format.
-
-    The data file is expected to have the keys:
-
-    - ``X``    : Array of training input images.
-    - ``Y``    : Array of corresponding target images.
-    - ``axes`` : Axes of the training images.
-
-
-    Parameters
-    ----------
-    file : str
-        File name
-    validation_split : float
-        Fraction of images to use as validation set during training.
-    axes: str, optional
-        Must be provided in case the loaded data does not contain ``axes`` information.
-    n_images : int, optional
-        Can be used to limit the number of images loaded from data.
-    verbose : bool, optional
-        Can be used to display information about the loaded images.
-
-    Returns
-    -------
-    tuple( tuple(:class:`numpy.ndarray`, :class:`numpy.ndarray`), tuple(:class:`numpy.ndarray`, :class:`numpy.ndarray`), str )
-        Returns two tuples (`X_train`, `Y_train`), (`X_val`, `Y_val`) of training and validation sets
-        and the axes of the input images.
-        The tuple of validation data will be ``None`` if ``validation_split = 0``.
-
-    """
-    
-    f = np.load(file)
-    X, Y = f['X'], f['Y']
-    print(Y.ndim, Y.shape)
-    if axes is None:
-        axes = f['axes']
-    axes = axes_check_and_normalize(axes)
-    
-    assert X.ndim == Y.ndim
-    assert len(axes) == X.ndim
-    assert 'C' in axes
-    if n_images is None:
-        n_images = X.shape[0]
-    assert X.shape[0] == Y.shape[0]
-    assert 0 < n_images <= X.shape[0]
-    assert 0 <= validation_split < 1
-    
-    X, Y = X[:n_images], Y[:n_images]
-    channel = axes_dict(axes)['C']
-    
-    if validation_split > 0:
-        n_val = int(round(n_images * validation_split))
-        n_train = n_images - n_val
-        assert 0 < n_val and 0 < n_train
-        X_t, Y_t = X[-n_val:], Y[-n_val:]
-        X, Y = X[:n_train], Y[:n_train]
-        assert X.shape[0] == n_train and X_t.shape[0] == n_val
-        X_t = move_channel_for_backend(X_t, channel=channel)
-        Y_t = move_channel_for_backend(Y_t, channel=channel)
-    
-    X = move_channel_for_backend(X, channel=channel)
-    Y = move_channel_for_backend(Y, channel=channel)
-    
-    axes = axes.replace('C', '')  # remove channel
-    if backend_channels_last():
-        axes = axes + 'C'
-    else:
-        axes = axes[:1] + 'C' + axes[1:]
-    
-    data_val = (X_t, Y_t) if validation_split > 0 else None
-    
-    if verbose:
-        ax = axes_dict(axes)
-        n_train, n_val = len(X), len(X_t) if validation_split > 0 else 0
-        image_size = tuple(X.shape[ax[a]] for a in axes if a in 'TZYX')
-        n_dim = len(image_size)
-        n_channel_in, n_channel_out = X.shape[ax['C']], Y.shape[ax['C']]
-        
-        print('number of training images:\t', n_train)
-        print('number of validation images:\t', n_val)
-        print('image size (%dD):\t\t' % n_dim, image_size)
-        print('axes:\t\t\t\t', axes)
-        print('channels in / out:\t\t', n_channel_in, '/', n_channel_out)
-    
-    return (X, Y), data_val, axes
-
 
 
 def np2Tensor(*args):
@@ -121,41 +32,39 @@ def loadData(traindatapath, axes='SCYX', validation_split=0.05):
     else:
         (X, Y), _, axes = load_training_data(traindatapath, validation_split=validation_split, axes=axes, verbose=True)
         X_val, Y_val = 0, 1
-    print(X.shape, Y.shape)
+    print(X.shape, Y.shape)  # (18468, 128, 128, 1) (18468, 256, 256, 1)
     return X, Y, X_val, Y_val
 
 
-class SR(data.Dataset):
-    def __init__(self, scale=2, name='CCPs', train=True, benchmark=False, patch_size=64, test_only=False,
-                 rootdatapath='/mnt/home/user1/MCX/Medical/CSBDeep-master/DataSet/BioSR_WF_to_SIM/DL-SR-main/dataset/'):
-        self.patch_size = patch_size
-        self.rgb_range = 1
+class DIV2K(data.Dataset):
+    def __init__(self, args, name='CCPs', train=True, benchmark=False):
+        self.args = args
         self.name = name
         self.train = train
-        self.test_only = test_only
         self.benchmark = benchmark
-        self.dir_data = rootdatapath+'train/%s/my_training_data.npz' % name
-        self.dir_demo = rootdatapath+'test/%s/LR/' % name
-        
+        self.dir_data = f'{CSB_path}/DataSet/BioSR_WF_to_SIM/DL-SR-main/dataset/train/%s/my_training_data.npz' % args.data_test
+        self.dir_demo = f'{CSB_path}/DataSet/BioSR_WF_to_SIM/DL-SR-main/dataset/test/%s/LR/' % args.data_test
+
         self.input_large = (self.dir_demo != '')
-        self.scale = scale
+        self.scale = args.scale
         if train:
-            X, Y, X_val, Y_val = self.loadData()
+            X, Y, X_val, Y_val = self.loadData()  # (18468, 128, 128, 1) (18468, 256, 256, 1)
             print('np.isnan(X).any(), np.isnan(Y).any()', np.isnan(X).any(), np.isnan(Y).any())
             list_hr, list_lr = Y, X
         else:
             self.filenames = glob.glob(self.dir_demo + '*.tif')
-            list_hr, list_lr, name = self._scan()            
+            list_hr, list_lr, name = self._scan()
+            if not args.test_only:
+                list_hr = list_hr[:5]
+                list_lr = list_lr[:5]
             self.name = name
-            if not self.test_only:
-                list_hr, list_lr, name = list_hr[:5], list_lr[:5], name[:5]
 
         self.images_hr, self.images_lr = list_hr, list_lr
         self.repeat = 1
-
+        
     def loadData(self):
-        patch_size = self.patch_size
-        X, Y, X_val, Y_val = loadData(self.dir_data)
+        patch_size = self.args.patch_size
+        X, Y, X_val, Y_val = loadData(self.dir_data)  # (18468, 128, 128, 1) (18468, 256, 256, 1)
 
         N, height, width, c = X.shape
         X1 = []
@@ -175,10 +84,11 @@ class SR(data.Dataset):
                     else:
                         X1.append(X[n][j:j + patch_size, i:i + patch_size, :])
                         Y1.append(Y[n][j * 2:j * 2 + patch_size * 2, i * 2:i * 2 + patch_size * 2, :])
-            
-        return X1, Y1, X_val, Y_val
-    
+        
+        return X1, Y1, X_val, Y_val   # return np.array(X1), np.array(Y1), X_val, Y_val
+
     def _scan(self):
+        
         list_hr, list_lr, nm = [], [], []
         for fi in self.filenames:
             hr = np.array(Image.open(fi.replace('LR', 'GT')))
@@ -195,16 +105,16 @@ class SR(data.Dataset):
         else:
             lr, hr, filename = self.images_lr[idx], self.images_hr[idx], self.name[idx]
         
-        hr = normalize(hr, datamin, datamax, clip=True) * self.rgb_range
-        lr = normalize(lr, datamin, datamax, clip=True) * self.rgb_range
-        pair = (lr, hr)
+        hr = normalize(hr, datamin, datamax, clip=True) * self.args.rgb_range
+        lr = normalize(lr, datamin, datamax, clip=True) * self.args.rgb_range
+        pair = (lr, hr)   # (128, 128, 1) (256, 256, 1)
         pair_t = np2Tensor(*pair)
         
         return pair_t[0], pair_t[1], filename
 
     def __len__(self):
-        print('len(self.images_hr)', len(self.images_hr))
-        return len(self.images_hr)
+        # print('len(self.images_hr)', len(self.images_hr))
+        return len(self.images_hr) * self.repeat
         
     def _get_index(self, idx):
         if self.train:
@@ -214,26 +124,24 @@ class SR(data.Dataset):
 
 
 class Flourescenedenoise(data.Dataset):
-    def __init__(self, name='Denoising_Planaria', istrain=True, c=1, patch_size=64, test_only=False,
-                 rootdatapath='/mnt/home/user1/MCX/Medical/CSBDeep-master/DataSet/'):
-        self.patch_size = patch_size
-        self.rgb_range = 1
-        self.datamin, self.datamax = 0, 100
+    def __init__(self, args, istrain=True, c=1):
+        self.args = args
+        self.batch = 1
+        self.datamin, self.datamax = args.datamin, args.datamax
         self.istrain = istrain
-        self.test_only = test_only
-
-        self.denoisegt = name  # ['Denoising_Planaria', 'Denoising_Tribolium', 'Synthetic_tubulin_granules', 'Synthetic_tubulin_gfp']
-        self.datapath = rootdatapath + '%s/' % self.denoisegt
-
+        
+        if self.args.data_test:
+            self.denoisegt = [self.args.data_test]
+        else:
+            self.denoisegt = ['Denoising_Planaria', 'Denoising_Tribolium'               ]
+        
         if istrain:
             self._scandenoisenpy()
         else:
             self._scandenoisetif(c)
-            if self.test_only:
-                self.nm_lrdenoise = self.nm_lrdenoise[:5]
         
         self.lenthdenoise = len(self.nm_lrdenoise)
-        self.lenth = self.lenthdenoise
+        self.lenth = self.lenthdenoise // self.batch
         
         if istrain:
             print('++ ++ ++ ++ ++ ++ length of training images = ', self.lenth, '++ ++ ++ ++ ++ ++')
@@ -243,104 +151,94 @@ class Flourescenedenoise(data.Dataset):
     def _scandenoisenpy(self):
         hr = []
         lr = []
-        patch_size = self.patch_size
-        
-        if 'Denoising' in self.denoisegt:
-            X, Y, X_val, Y_val = loadData(self.datapath + 'train_data/data_label.npz', axes='SCZYX')
-        else:
-            X, Y, X_val, Y_val = loadData(self.datapath + 'train_data/data_label.npz')
-
-        print('Dataset:', self.denoisegt, 'np.isnan(X).any(), np.isnan(Y).any()', np.isnan(X).any(), np.isnan(Y).any())
-        print('X.shape, Y.shape, X_val.shape, Y_val.shape = ', X.shape, Y.shape, X_val.shape, Y_val.shape)
-        height, width = X.shape[-3:-1]
-        X = np.reshape(X, [-1, height, width, 1])
-        Y = np.reshape(Y, [-1, height, width, 1])
-        assert len(X) == len(Y)
-        if not 'Denoising' in self.denoisegt:
-            X1 = []
-            Y1 = []
-            for n in range(len(X)):
-                for i in range(0, width, patch_size):
-                    for j in range(0, height, patch_size):
-                        X1.append(X[n][j:j + patch_size, i:i + patch_size, :])
-                        Y1.append(Y[n][j:j + patch_size, i:i + patch_size, :])
-            hr.extend(Y1)
-            lr.extend(X1)
-        else:
+        datapath = f'{CSB_path}/DataSet/'
+        for i in self.denoisegt:
+            # Planaria: X/Y  (17005, 16, 64, 64, 1)(895, 16, 64, 64, 1)  float32
+            # Tr  (14725, 16, 64, 64, 1) (775, 16, 64, 64, 1)
+            X, Y, X_val, Y_val = loadData(datapath + i + '/train_data/data_label.npz', axes='SCZYX')
+            
+            print('Dataset:', i, 'np.isnan(X).any(), np.isnan(Y).any()', np.isnan(X).any(), np.isnan(Y).any())
+            print('X.shape, Y.shape, X_val.shape, Y_val.shape = ', X.shape, Y.shape, X_val.shape, Y_val.shape)
+            height, width = X.shape[-3:-1]
+            X = np.reshape(X, [-1, height, width, 1])
+            Y = np.reshape(Y, [-1, height, width, 1])
+            assert len(X) == len(Y)
             hr.extend(Y)
             lr.extend(X)
-            
         self.nm_hrdenoise, self.nm_lrdenoise = hr, lr
         assert len(hr) == len(lr)
     
     def _scandenoisetif(self, c=1):
         lr = []
-        if ('Planaria' in self.denoisegt) or ('Tribolium' in self.denoisegt):
-            lr.extend(sorted(glob.glob(self.datapath + 'test_data/condition_%d/*.tif' % c)))
-            self.hrpath = self.datapath + 'test_data/GT/'
-            
+        datapath = f'{CSB_path}/DataSet/'
+        lr.extend(sorted(glob.glob(datapath + '%s/test_data/condition_%d/*.tif' % (self.denoisegt[0], c))))
+        self.hrpath = datapath + '%s/test_data/GT/' % self.denoisegt[0]
         lr.sort()
         self.nm_lrdenoise = lr
     
     def __getitem__(self, idx):
         idx = idx % self.lenth
         if self.istrain:
-            lr, hr, filename = self._load_file_denoise_npy(idx + 5//2)
+            lr, hr, filename = self._load_file_denoise_npy(idx + self.args.inputchannel//2)
         else:
             lr, hr, filename, d = self._load_file_denoise(idx)
-        lr = torch.from_numpy(np.ascontiguousarray(lr * self.rgb_range)).float()
-        hr = torch.from_numpy(np.ascontiguousarray(hr * self.rgb_range)).float()
+        lr = torch.from_numpy(np.ascontiguousarray(lr * self.args.rgb_range)).float()
+        hr = torch.from_numpy(np.ascontiguousarray(hr * self.args.rgb_range)).float()
         return lr, hr, filename
     
     def __len__(self):
         if self.istrain:
-            return self.lenth - 2 * (5//2)
+            return self.lenth - 2 * (self.args.inputchannel//2)
         else:
             return self.lenth
     
     def _load_file_denoise(self, idn):
         filename, fmt = os.path.splitext(os.path.basename(self.nm_lrdenoise[idn]))
-        rgb = np.float32(imread(self.hrpath + filename + fmt))
+
+        rgb = np.float32(imread(self.hrpath + filename + fmt))  # / 65535
         rgblr = np.float32(imread(self.nm_lrdenoise[idn]))
-        
         # print('Test Denoise, ----> rgblr.max/min', rgblr.max(), rgblr.min(), rgblr.shape)
-        return rgblr, rgb, filename, self.denoisegt
+        return rgblr, rgb, filename, self.denoisegt[0]
 
     def _load_file_denoise_npy(self, idx):
         lr = []
         hr = []
-        idn = (idx) % self.lenthdenoise
-        hr.extend(self.nm_hrdenoise[idn:idn + 1])
-        lr.extend(self.nm_lrdenoise[idn - 5 // 2:idn + 5 // 2 + 1])
-        rgb = np.concatenate(hr, -1)
-        rgblr = np.squeeze(np.concatenate(lr, -1))
-        rgb = np.transpose(np.float32(rgb), (2, 0, 1))
-        rgblr = np.transpose(np.float32(rgblr), (2, 0, 1))
+        if self.args.inputchannel > 1:
+            for i in range(self.batch):
+                idn = (idx + i) % self.lenthdenoise
+                hr.extend(self.nm_hrdenoise[idn:idn + 1])
+                lr.extend(self.nm_lrdenoise[idn - self.args.inputchannel // 2:idn + self.args.inputchannel // 2 + 1])
+            rgb = np.concatenate(hr, -1)  # 0~4.548696  [B, 64, 64, 1]
+            rgblr = np.squeeze(np.concatenate(lr, -1))  # 0~87.93965  [B, 64, 64, 5]
+            rgb = np.transpose(np.float32(rgb), (2, 0, 1))  # [5, 256, 256]
+            rgblr = np.transpose(np.float32(rgblr), (2, 0, 1))
+        else:
+            for i in range(self.batch):
+                idn = (idx + i) % self.lenthdenoise
+                hr.append(self.nm_hrdenoise[idn])
+                lr.append(self.nm_lrdenoise[idn])
+    
+            rgb = np.squeeze(np.concatenate(hr, -1))
+            rgblr = np.squeeze(np.concatenate(lr, -1))
+            rgb = np.transpose(np.float32(rgb), (2, 0, 1))  # [1, 256, 256]
+            rgblr = np.transpose(np.float32(rgblr), (2, 0, 1))
         
         return rgblr, rgb, ''
 
 
 class Flouresceneiso(data.Dataset):
-    def __init__(self, name='Isotropic_Liver', istrain=True, patch_size=64, test_only=False,
-                rootdatapath='/mnt/home/user1/MCX/Medical/CSBDeep-master/DataSet/Isotropic/'):
-        self.patch_size = patch_size
-        self.rgb_range = 1
+    def __init__(self, args, istrain=True):
+        self.args = args
+        self.batch = 1
         self.datamin, self.datamax = 0, 100
         self.istrain = istrain
-        self.test_only = test_only
 
-        self.iso = name  # ['Isotropic_Liver', 'Isotropic_Retina', 'Isotropic_Drosophila']  #
-        self.datapath = rootdatapath + '%s/train_data/' % self.iso
-        self.dir_lr = rootdatapath + '%s/test_data/' % self.iso
+        self.iso = ['Isotropic_Liver']
         if istrain:
             self._scanisonpy()
-            self.lenth = len(self.nm_lriso)
         else:
             self._scaniso()
-            if self.test_only:
-                self.nm_lr = self.nm_lr[:5]
-            self.lenth = len(self.nm_lr)
-                    
+            
         if istrain:
             print('++ ++ ++ ++ ++ ++ length of training images = ', self.lenth, '++ ++ ++ ++ ++ ++')
         else:
@@ -349,52 +247,54 @@ class Flouresceneiso(data.Dataset):
     def _scanisonpy(self):
         hr = []
         lr = []
-        patch_size = self.patch_size
-        X, Y, _, _ = loadData(self.datapath + 'data_label.npz', axes='SCYX', validation_split=0.0)
-
-        print('Dataset:', self.iso, 'np.isnan(X).any(), np.isnan(Y).any()', np.isnan(X).any(), np.isnan(Y).any())
-        print('X.shape, Y.shape = ', X.shape, Y.shape)
-        height, width = X.shape[1:3]
-        assert len(X) == len(Y)
-
-        if patch_size < height:
-            X1 = []
-            Y1 = []
-            for n in range(len(X)):
-                for i in range(0, width, patch_size):
-                    for j in range(0, height, patch_size):
-                        X1.append(X[n][j:j + patch_size, i:i + patch_size, :])
-                        Y1.append(Y[n][j:j + patch_size, i:i + patch_size, :])
-            hr.extend(Y1)
-            lr.extend(X1)
-        else:
-            hr.extend(Y)
-            lr.extend(X)
+        patch_size = self.args.patch_size
+    
+        datapath = f'{CSB_path}/DataSet/Isotropic/'
+        for i in self.iso:
+            # Liver X/Y (3872, 128, 128, 1)
+            X, Y, _, _ = loadData(datapath + '%s/train_data/data_label.npz' % i, axes='SCYX', validation_split=0.0)
+            
+            print('Dataset:', i, 'np.isnan(X).any(), np.isnan(Y).any()', np.isnan(X).any(), np.isnan(Y).any())
+            print('X.shape, Y.shape = ', X.shape, Y.shape)
+            height, width = X.shape[1:3]
+            assert len(X) == len(Y)
+            
+            if patch_size < height:
+                X1 = []
+                Y1 = []
+                for n in range(len(X)):
+                    for i in range(0, width, patch_size):
+                        for j in range(0, height, patch_size):
+                            X1.append(X[n][j:j + patch_size, i:i + patch_size, :])
+                            Y1.append(Y[n][j:j + patch_size, i:i + patch_size, :])
+                hr.extend(Y1)
+                lr.extend(X1)
+            else:
+                hr.extend(Y)
+                lr.extend(X)
 
         self.nm_hriso, self.nm_lriso = hr, lr
+        self.lenth = len(self.nm_lriso)
 
     def _scaniso(self):
         hr = []
         lr = []
-        if self.iso == 'Isotropic_Liver':
-            hr.append(self.dir_lr + 'input_subsample_1_groundtruth.tif')
+        for i in self.iso:
+            self.dir_lr = f'{CSB_path}/DataSet/Isotropic/%s/test_data/' % i
+            hr.append(self.dir_lr + 'input_subsample_1_groundtruth.tif')  # Liver [301, 752, 752]
             lr.append(self.dir_lr + 'input_subsample_8.tif')
-        else:
-            filenames = os.listdir(self.dir_lr)
-            for fi in range(len(filenames)):
-                name = filenames[fi][:-4]
-                lr.append(self.dir_lr + name + '.tif')
             
         self.nm_hr, self.nm_lr = hr, lr
-        
+        self.lenth = len(self.nm_lr)
+
     def __getitem__(self, idx):
         idx = idx % self.lenth
         if self.istrain:
             lr, hr, filename = self._load_file_iso_npy(idx)
         else:
             lr, hr, filename = self._load_file_isotest(idx)
-        lr = torch.from_numpy(np.ascontiguousarray(lr * self.rgb_range)).float()
-        hr = torch.from_numpy(np.ascontiguousarray(hr * self.rgb_range)).float()
+        lr = torch.from_numpy(np.ascontiguousarray(lr * self.args.rgb_range)).float()
+        hr = torch.from_numpy(np.ascontiguousarray(hr * self.args.rgb_range)).float()
         
         return lr, hr, filename
     
@@ -404,52 +304,44 @@ class Flouresceneiso(data.Dataset):
     def _load_file_iso_npy(self, idx):
         lr = []
         hr = []
-        idn = (idx) % self.lenth
-        hr.append(self.nm_hriso[idn])
-        lr.append(self.nm_lriso[idn])
-
+        for i in range(self.batch):
+            idn = (idx + i) % self.lenth
+            hr.append(self.nm_hriso[idn])
+            lr.append(self.nm_lriso[idn])
+    
         rgb = np.concatenate(hr, -1)
         rgblr = np.concatenate(lr, -1)
-        rgb = np.transpose(np.float32(rgb), (2, 0, 1))
+        rgb = np.transpose(np.float32(rgb), (2, 0, 1))  # [1, 128, 128]
         rgblr = np.transpose(np.float32(rgblr), (2, 0, 1))
     
         return rgblr, rgb, ''
 
     def _load_file_isotest(self, idx):
         filename, i = os.path.splitext(os.path.basename(self.nm_lr[idx]))
-        
         rgblr = np.float32(imread(self.nm_lr[idx]))
-        
-        if 'Isotropic_Liver' in self.nm_lr[idx]:
-            hrp = self.nm_lr[idx].replace('_8.tif', '_1_groundtruth.tif')
-            rgb = np.float32(imread(hrp))
-            return rgblr, rgb, filename
-        elif 'Retina' in self.nm_lr[idx]:
-            rgblr = np.transpose(zoom(rgblr, (10.2, 1, 1, 1), order=1), [0, 2, 3, 1])
-        
-        print('ISO Testset ', i, ', ----> rgblr.max()', rgblr.max(), rgblr.shape)
-        return rgblr, rgblr, filename
 
+        # Liver [301, 752, 752]
+        hrp = self.nm_lr[idx].replace('_8.tif', '_1_groundtruth.tif')
+        try:
+            rgb = np.float32(imread(hrp))
+        except:
+            rgb = np.ones([301, 752, 752])
+        
+        return rgblr, rgb, filename
+        
 
 class Flouresceneproj(data.Dataset):
-    def __init__(self, patch_size=64, name='Projection_Flywing', istrain=True, condition=0, test_only=False,
-                 rootdatapath='/mnt/home/user1/MCX/Medical/CSBDeep-master/DataSet/'):
-        # '/mnt/home/user1/MCX/Medical/CSBDeep-master/examples/projection/data/'
-        self.patch_size = patch_size
-        self.rgb_range = 1
+    def __init__(self, args, istrain=True, condition=0):
+        self.args = args
+        self.batch = 1
         self.istrain = istrain
-        self.test_only = test_only
-        self.iso = [name]
-        self.rootdatapath = rootdatapath + '%s/' % self.iso[0]
+        self.conv2d = True
+        self.iso = ['Projection_Flywing']  #
         if istrain:
             self._scannpy()
         else:
             self._scan(condition)
-            if self.test_only:
-                self.nm_lr = self.nm_lr[:5]
-                
-        self.lenth = len(self.nm_lr)
-
+            
         if istrain:
             print('++ ++ ++ ++ ++ ++ length of training images = ', self.lenth, '++ ++ ++ ++ ++ ++')
         else:
@@ -461,9 +353,8 @@ class Flouresceneproj(data.Dataset):
         X, Y = f['X'], f['Y']
         Y = np.expand_dims(Y, 2)
         print(Y.ndim, Y.shape)
-        # flying data_label
         if axes is None:
-            axes = f['axes']  #
+            axes = f['axes']  # 'SCZYX'
         axes = axes_check_and_normalize(axes)
     
         assert X.ndim == Y.ndim
@@ -500,16 +391,20 @@ class Flouresceneproj(data.Dataset):
             print('channels in / out:\t\t', n_channel_in, '/', n_channel_out)
     
         return X, Y
-
+    
     def _scannpy(self):
-        patch_size = self.patch_size
-        mytraindata = 2
-        datapath = '/mnt/home/user1/MCX/Medical/CSBDeep-master/examples/projection/data/my_training_data.npz'
-        datapath2 = self.rootdatapath + 'train_data/data_label.npz'
-
+        patch_size = self.args.patch_size
+        mytraindata = 2  # 1  # 0  #
+        
         if mytraindata == 1:
+            datapath = f'{CSB_path}/DataSet/%s/train_data/my_training_data.npz' % \
+                        self.iso[0]
             X, Y, _, _ = loadData(datapath, axes=None, validation_split=0.0)
         elif mytraindata == 2:
+            datapath = f'{CSB_path}/DataSet/%s/train_data/my_training_data.npz' % \
+                        self.iso[0]
+            datapath2 = f'{CSB_path}/DataSet/%s/train_data/data_label.npz' % \
+                        self.iso[0]
             X1, Y1, _, _ = loadData(datapath, axes=None, validation_split=0.0)
             X1l = []
             Y1l = []
@@ -520,12 +415,13 @@ class Flouresceneproj(data.Dataset):
                         Y1l.append(Y1[n][:, j:j + 64, i:i + 64, :])
             X1 = np.array(X1l)  # [3136, 50, 64, 64, 1]
             Y1 = np.array(Y1l)
-            X2, Y2 = self.load_training_data(datapath2, axes='SCZYX', verbose=True)
+            
+            X2, Y2 = self.load_training_data(datapath2, axes='SCZYX', verbose=True)  # 0~38.15789, 0~4.73316
             X = np.concatenate([X1, X2], 0)  # [20916, 50, 64, 64, 1]
             Y = np.concatenate([Y1, Y2], 0)
         else:
-            # data_label  (17780, 50, 64, 64, 1) (17780, 1, 64, 64, 1)
-            X, Y = self.load_training_data(datapath2, axes='SCZYX', verbose=True)
+            datapath = f'{CSB_path}/DataSet/%s/train_data/data_label.npz' % self.iso[0]
+            X, Y = self.load_training_data(datapath, axes='SCZYX', verbose=True)  # 0~38.15789, 0~4.73316
             
         print('Dataset:', self.iso[0], 'np.isnan(X).any(), np.isnan(Y).any()', np.isnan(X).any(), np.isnan(Y).any())
         print('X.shape, Y.shape = ', X.shape, Y.shape)
@@ -544,19 +440,21 @@ class Flouresceneproj(data.Dataset):
             Y1 = Y
             X1 = X
         self.nm_hr, self.nm_lr = Y1, X1
+        self.lenth = len(self.nm_lr)
     
     def _scan(self, condition):
         hr = []
         lr = []
-        self.dir_lr = self.rootdatapath + 'test_data/'
-
-        lr.extend(glob.glob(self.dir_lr + 'Input/C%d/*.tif' % condition))
-        hr.extend(glob.glob(self.dir_lr + 'GT/C2/*.tif'))
+        for i in self.iso:
+            self.dir_lr = f'{CSB_path}/DataSet/%s/test_data/' % i
+            
+            lr.extend(glob.glob(self.dir_lr + 'Input/C%d/*.tif' % condition))  # [50, 520, 692]
+            hr.extend(glob.glob(self.dir_lr + 'GT/C%d/*.tif' % condition))  # [692, 520]
+        hr.sort()  # proj_C2_T026.tif
+        lr.sort()  # C1_T026.tif  #
         
-        hr.sort()
-        lr.sort()
-
         self.nm_hr, self.nm_lr = hr, lr
+        self.lenth = len(self.nm_lr)
     
     def __getitem__(self, idx):
         idx = idx % self.lenth
@@ -564,8 +462,8 @@ class Flouresceneproj(data.Dataset):
             lr, hr, filename = self._load_file_npy(idx)
         else:
             lr, hr, filename = self._load_file_test(idx)
-        lr = torch.from_numpy(np.ascontiguousarray(lr * self.rgb_range)).float()
-        hr = torch.from_numpy(np.ascontiguousarray(hr * self.rgb_range)).float()
+        lr = torch.from_numpy(np.ascontiguousarray(lr * self.args.rgb_range)).float()
+        hr = torch.from_numpy(np.ascontiguousarray(hr * self.args.rgb_range)).float()
         
         return lr, hr, filename
     
@@ -573,44 +471,57 @@ class Flouresceneproj(data.Dataset):
         return self.lenth
     
     def _load_file_npy(self, idn):
-        hr = self.nm_hr[idn]
-        lr = self.nm_lr[idn]
-        
-        rgb = np.float32(np.squeeze(hr, -1))
-        rgblr = np.float32(np.squeeze(lr))
+        rgb = np.float32(self.nm_hr[idn])  # [1, 128, 128, 1]
+        rgblr = np.float32(self.nm_lr[idn])  # [50, 128, 128, 1]
+
+        rgb = np.squeeze(rgb, -1)
+        rgblr = np.squeeze(rgblr)
+        if not self.conv2d:
+            rgblr = np.expand_dims(rgblr, 0)  # 1, 50, 128, 128
         
         return rgblr, rgb, ''
     
     def _load_file_test(self, idx):
         filename, i = os.path.splitext(os.path.basename(self.nm_lr[idx]))
         
-        rgblr = np.float32(imread(self.nm_lr[idx]))
-        rgb = np.expand_dims(np.float32(imread(self.nm_hr[idx])), 0)
+        rgblr = np.float32(imread(self.nm_lr[idx]))  # [50, 520, 692] 0~310
+        rgb = np.expand_dims(np.float32(imread(self.nm_hr[idx])), 0)  # [1, 520, 692] 0~147
+        _, h, w = rgblr.shape
+        h = h // 16 * 16
+        w = w // 16 * 16
+        rgb = rgb[:, :h, :w]
+        rgblr = rgblr[:, :h, :w]
         
+        if not self.conv2d:
+            rgblr = np.expand_dims(rgblr, 0)  # 1, 50,256,256
+
         return rgblr, rgb, filename
 
 
+import imageio
+
+
 class FlouresceneVCD:
-    def __init__(self, patch_size=64, istrain=True, test_only=False, subtestset='to_predict',
-                 rootdatapath='/mnt/home/user1/MCX/Medical/VCD-Net-main/vcdnet/'):
-        self.path = rootdatapath
+    def __init__(self, args, istrain=True, subtestset='to_predict'):
+        self.path = f'{VCD_path}/vcdnet/vcd-example-data/data/'
         self.istrain = istrain
-        self.test_only = test_only
-        self.patch_size = patch_size
-        self.rgb_range = 1
-        self.lf2d_base_size = patch_size // 11
+        self.args = args
+        self.lf2d_base_size = args.patch_size // 11
         self.n_slices = 61
         self.n_num = 11
         self.shuffle = True
-        if test_only:
-            self.nm_lr2d = sorted(glob.glob(self.path + '%s/*.tif' % subtestset))
-            self.nm_hr3d = sorted(glob.glob(self.path + 'results/VCD_tubulin/*.tif'))
+        if args.test_only:
+            if subtestset == 'to_predict':
+                self.nm_lr2d = sorted(glob.glob(self.path + '%s/*.tif' % subtestset))
+                self.nm_hr3d = sorted(glob.glob(f'{VCD_path}/vcdnet/results/VCD_tubulin/*.tif'))
         else:
-            self.nm_hr3d = sorted(glob.glob(self.path + 'vcd-example-data/data/train/WF/*.tif'))
-            self.nm_lr2d = sorted(glob.glob(self.path + 'vcd-example-data/data/train/LF/*.tif'))
-            
+            self.nm_hr3d = sorted(glob.glob(self.path + 'train/WF/*.tif'))
+            self.nm_lr2d = sorted(glob.glob(self.path + 'train/LF/*.tif'))
+            if not istrain:  # valid
+                self.nm_lr2d = self.nm_lr2d[:1]
+                self.nm_hr3d = self.nm_hr3d[:1]
         assert len(self.nm_hr3d) == len(self.nm_lr2d)
-
+        
         self.lenth = len(self.nm_lr2d)
 
         if istrain:
@@ -624,6 +535,7 @@ class FlouresceneVCD:
             """
         
             image = np.squeeze(image)  # remove channels dimension
+            # print('reshape : ' + str(image.shape))
             depth, height, width = image.shape
             image_re = np.zeros([height, width, depth])
             for d in range(depth):
@@ -701,38 +613,37 @@ class FlouresceneVCD:
             if t2d:
                 image = imageio.imread(img_file)
                 if image.ndim == 2:
-                    image = image[:, :, np.newaxis]
-                img = normalize(image)
-                img = lf_extract_fn(img, n_num=self.n_num, padding=False)
+                    image = image[:, :, np.newaxis]  # uint8 0~48 (176,176,1) (649, 649,1)
+                img = normalize(image)  # float64 -1~1 (176,176,1)
+                img = lf_extract_fn(img, n_num=self.n_num, padding=False)  # (16, 16, 121) (59, 59, 121)
             else:
-                image = imageio.volread(img_file)
-                img = normalize(image)
-                img = rearrange3d_fn(img)
+                image = imageio.volread(img_file)  # uint8 0~132  [61,176,176]
+                img = normalize(image)  # float64 -1~1 (61,176,176)
+                img = rearrange3d_fn(img)  # (176,176,61)
     
             img = img.astype(np.float32, casting='unsafe')
+            # print('\r%s : %s' % (img_file, str(img.shape)), end='')
             return img
         
-        training_data_lf2d = _load_imgs(self.nm_lr2d[idx], True)
+        training_data_lf2d = _load_imgs(self.nm_lr2d[idx], True)  # (16, 16, 121)
         X = np.transpose(training_data_lf2d, (2, 0, 1))
-        
-        if self.test_only:
-            training_data_hr3d = _load_imgs(self.nm_hr3d[idx], False)
+        if self.args.test_only:
+            training_data_hr3d = _load_imgs(self.nm_hr3d[idx], False)  # (176, 176, 61)
             name = os.path.basename(self.nm_hr3d[idx])[:-4]
             Y = np.transpose(training_data_hr3d, (2, 0, 1))
         else:
             training_data_hr3d = _load_imgs(self.nm_hr3d[idx], False)
             Y = np.transpose(training_data_hr3d, (2, 0, 1))
             name = ''
-        # print('Y.shape, X.shape = ', Y.shape, X.shape)
-        
         return Y, X, name
 
     def __getitem__(self, idx):
         idx = idx % self.lenth
         hr, lr, filename = self._load_dataset(idx)
         
-        lr = torch.from_numpy(np.ascontiguousarray(lr * self.rgb_range)).float()
-        hr = torch.from_numpy(np.ascontiguousarray(hr * self.rgb_range)).float()
+        lr = torch.from_numpy(np.ascontiguousarray(lr * self.args.rgb_range)).float()
+        hr = torch.from_numpy(np.ascontiguousarray(hr * self.args.rgb_range)).float()
+
         return lr, hr, filename
 
     def __len__(self):

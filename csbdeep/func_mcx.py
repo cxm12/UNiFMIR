@@ -1,8 +1,11 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from .utils.tf import K, tf
-from skimage.metrics import structural_similarity as compare_ssim
-from skimage.metrics import peak_signal_noise_ratio as compare_psnr
+from .utils.tf import K, IS_TF_1, tf
+if IS_TF_1:
+    from skimage.measure import compare_psnr, compare_ssim
+else:
+    from skimage.metrics import structural_similarity as compare_ssim
+    from skimage.metrics import peak_signal_noise_ratio as compare_psnr
 
 
 def get_flops(model):
@@ -221,8 +224,27 @@ def savecolorim(save, im, norm=True, **imshow_kwargs):
     # # font = {'size': 16}
     # # cb.set_label('colorbar_title', fontdict=font)
     # plt.show()
-    
-    plt.imsave(save, im, **imshow_kwargs)
+    if save is not None:
+        plt.imsave(save, im, **imshow_kwargs)
+    else:
+        # Make a random plot...
+        fig = plt.figure()
+        fig.add_subplot(111)
+
+        # If we haven't already shown or saved the plot, then we need to
+        # draw the figure first...
+        plt.imshow(im, **imshow_kwargs)
+        plt.axis('off')
+        fig.subplots_adjust(bottom = 0)
+        fig.subplots_adjust(top = 1)
+        fig.subplots_adjust(right = 1)
+        fig.subplots_adjust(left = 0)
+
+        # Now we can save it to a numpy array.
+        fig.canvas.draw()
+        data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        return data
 
 
 def savecolorim1(save, im, **imshow_kwargs):
