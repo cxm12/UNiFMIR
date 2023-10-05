@@ -7,7 +7,7 @@ def make_model(args):
     args.n_resblocks = 64
     args.n_feats = 256
     return UniModel(args=args)
-    
+
 
 class UniModel(nn.Module):
     def __init__(self, args, tsk=1, img_size=64, patch_size=1,
@@ -15,7 +15,7 @@ class UniModel(nn.Module):
                  window_size=8, mlp_ratio=2., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, patch_norm=True,
-                 use_checkpoint=False, num_feat=32):
+                 use_checkpoint=False, num_feat=32, srscale=2):
         super(UniModel, self).__init__()
         self.img_range = 1
         self.mean = torch.zeros(1, 1, 1, 1)
@@ -24,16 +24,19 @@ class UniModel(nn.Module):
         
         # 1 SR
         self.conv_firstsr = nn.Conv2d(1, embed_dim, 3, 1, 1)
-        self.upsamplesr = Upsample(2, num_feat)
+        self.upsamplesr = Upsample(srscale, num_feat)
+        
         # 2 denoise
         self.conv_firstdT = nn.Conv2d(5, embed_dim, 3, 1, 1)
+        
         # 3 iso
         self.conv_firstiso = nn.Conv2d(1, embed_dim, 3, 1, 1)
+        
         # 4 Projection
         args.n_resblocks = 64
         args.n_feats = 256
         args.inch = 50
-        self.project = ENLCN(args=args)
+        self.project = Projhead(args=args)
         self.conv_firstproj = nn.Conv2d(1, embed_dim, 3, 1, 1)
         
         # 5 2D to 3D
@@ -41,7 +44,6 @@ class UniModel(nn.Module):
         self.conv_firstv = nn.Conv2d(61, embed_dim, 3, 1, 1)
         self.conv_before_upsamplev = nn.Sequential(nn.Conv2d(embed_dim, embed_dim, 3, 1, 1), nn.LeakyReLU(inplace=True))
         self.conv_lastv = nn.Conv2d(embed_dim, 61, 3, 1, 1)
-
         
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=embed_dim, embed_dim=embed_dim,
@@ -96,62 +98,73 @@ class UniModel(nn.Module):
         x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
         return x
     
-    def forward(self, x):
+    def forward(self, x, tsk=0):
+        if tsk > 0:
+            self.task = tsk
+        
+        # ~~~~~~~~~~~~ Head ~~~~~~~~~~~~~~~ #
         if self.task == 1:
             x = self.check_image_size(x)
             self.mean = self.mean.type_as(x)
             x = (x - self.mean) * self.img_range
             x = self.conv_firstsr(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
-            x = self.conv_before_upsample0(x)
-            x = self.upsamplesr(x)
-            x = self.conv_last0(x)
         elif self.task == 2:
             x = self.check_image_size(x)
             self.mean = self.mean.type_as(x)
             x = (x - self.mean) * self.img_range
             x = self.conv_firstdT(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
-            x = self.conv_before_upsample0(x)
-            x = self.upsample(x)
-            x = self.conv_last0(x)
         elif self.task == 3:
             x = self.check_image_size(x)
             self.mean = self.mean.type_as(x)
             x = (x - self.mean) * self.img_range
             x = self.conv_firstiso(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
-            x = self.conv_before_upsample0(x)
-            x = self.upsample(x)
-            x = self.conv_last0(x)
         elif self.task == 4:
             x2d, closs = self.project(x)
-
             x2d = self.check_image_size(x2d)
             self.mean = self.mean.type_as(x2d)
             x2d = (x2d - self.mean) * self.img_range
-            
             x = self.conv_firstproj(x2d)
-            x = self.conv_after_body(self.forward_features(x))
-            x = self.conv_before_upsample0(x)
-            x = self.conv_last0(x)
-            return x2d, x / self.img_range + self.mean + x2d, closs
         elif self.task == 5:
             x = self.check_image_size(x)
             self.mean = self.mean.type_as(x)
             x = (x - self.mean) * self.img_range
             xunet = self.conv_first0(x)
-            
             x = self.conv_firstv(xunet)
-            x = self.conv_after_body(self.forward_features(x))  # + x
+        
+        # ~~~~~~~~~~~~ Feature enhancement ~~~~~~~~~~~~~
+        xfe = self.conv_after_body(self.forward_features(x))
+        
+        # ~~~~~~~~~~~~ Tail ~~~~~~~~~~~~~~~ #
+        if self.task == 1:
+            x = xfe + x
+            x = self.conv_before_upsample0(x)
+            x = self.upsamplesr(x)
+            x = self.conv_last0(x)
+        elif self.task == 2:
+            x = xfe + x
+            x = self.conv_before_upsample0(x)
+            x = self.upsample(x)
+            x = self.conv_last0(x)
+        elif self.task == 3:
+            x = xfe + x
+            x = self.conv_before_upsample0(x)
+            x = self.upsample(x)
+            x = self.conv_last0(x)
+        elif self.task == 4:
+            x = xfe
+            x = self.conv_before_upsample0(x)
+            x = self.conv_last0(x)
+            return x2d, x / self.img_range + self.mean + x2d  # , closs
+        elif self.task == 5:
+            x = xfe
             x = self.conv_before_upsamplev(x)
             x = self.conv_lastv(x)
             return xunet, x / self.img_range + self.mean
-
+        
         x = x / self.img_range + self.mean
-
+        
         return x
-
+    
     def forward_features(self, x):
         x_size = (x.shape[2], x.shape[3])
         x = self.patch_embed(x)
@@ -161,3 +174,4 @@ class UniModel(nn.Module):
         x = self.norm(x)
         x = self.patch_unembed(x, x_size)
         return x
+

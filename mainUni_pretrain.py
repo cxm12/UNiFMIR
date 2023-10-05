@@ -1,76 +1,70 @@
-import faulthandler
-
-faulthandler.enable()
-
 import torch
-import utility
-import loss
-
 torch.backends.cudnn.enabled = False
+import utility
+from utility import savecolorim
+import loss
 import argparse
-from mydata import SR, FlouresceneVCD, Flouresceneproj, Flouresceneiso, Flourescenedenoise
+from mydata import SR, FlouresceneVCD, Flouresceneproj, Flouresceneiso, Flourescenedenoise, \
+    normalize, PercentileNormalizer
 from torch.utils.data import dataloader
+import torch.nn.utils as utils
 import model
-
 import os
 from decimal import Decimal
-import torch.nn.utils as utils
 import imageio
-from utility import savecolorim
 import numpy as np
-from mydata import normalize, PercentileNormalizer
 from tifffile import imsave
+import random
 
-rp = os.path.dirname(__file__)
+
+gpu = torch.cuda.is_available()
 
 
 def options():
     parser = argparse.ArgumentParser(description='FMIR Model')
+    parser.add_argument('--task', type=int, default=-1)
     parser.add_argument('--model', default='Uni-SwinIR', help='model name')
-    parser.add_argument('--test_only', action='store_true', default=test_only, help='set this option to test the model')
-    parser.add_argument('--task', type=int, default=task)
+    parser.add_argument('--save', type=str, default='Uni-SwinIR-pretrain', help='file name to save')
+    parser.add_argument('--test_only', action='store_true', default=testonly, help='set this option to test the model')
+    parser.add_argument('--cpu', action='store_true', default=not gpu, help='cpu only')
     parser.add_argument('--resume', type=int, default=0, help='-2:best;-1:latest; 0:pretrain; >0: resume')
-    parser.add_argument('--pre_train', type=str, default=pre_train, help='pre-trained model directory')
-    parser.add_argument('--save', type=str, default=savename, help='_itefile name to save')
+    parser.add_argument('--pre_train', type=str, default=pretrain, help='pre-trained model directory')
     
     # Data specifications
-    parser.add_argument('--test_every', type=int, default=test_every)
-    parser.add_argument('--print_every', type=int, default=100, help='')
-    parser.add_argument('--data_test', type=str, default=testset, help='demo image directory')
-    parser.add_argument('--epochs', type=int, default=200, help='number of epochs to train')
-    parser.add_argument('--batch_size', type=int, default=batch, help='input batch size for training')
-    parser.add_argument('--patch_size', type=int, default=patch, help='input batch size for training')
+    parser.add_argument('--epochs', type=int, default=2000, help='number of epochs to train')
+    parser.add_argument('--batch_size', type=int, default=8, help='input batch size for training')
+    parser.add_argument('--patch_size', type=int, default=64, help='input batch size for training')
     parser.add_argument('--rgb_range', type=int, default=1, help='maximum value of RGBn_colors')
     parser.add_argument('--n_colors', type=int, default=1, help='')
     parser.add_argument('--datamin', type=int, default=0)
     parser.add_argument('--datamax', type=int, default=100)
-    # Loss specifications
-    parser.add_argument('--loss', type=str, default='1*L1', help='loss function configuration')
-    parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
-    parser.add_argument('--decay', type=str, default='100', help='learning rate decay type')
-    
-    parser.add_argument('--cpu', action='store_true', default=False, help='')
+
+    parser.add_argument('--print_every', type=int, default=200, help='')
+    parser.add_argument('--test_every', type=int, default=1000)
     parser.add_argument('--load', type=str, default='', help='file name to load')
+    parser.add_argument('--lr', type=float, default=0.00005, help='learning rate')
     
     parser.add_argument('--n_GPUs', type=int, default=1, help='number of GPUs')
     parser.add_argument('--n_resblocks', type=int, default=8, help='number of residual blocks')
     parser.add_argument('--n_feats', type=int, default=32, help='number of feature maps')
+
     parser.add_argument('--save_models', action='store_true', default=True, help='save all intermediate models')
-    
+
+    parser.add_argument('--template', default='.', help='You can set various templates in option.py')
     parser.add_argument('--scale', type=str, default='1', help='super resolution scale')
     parser.add_argument('--chop', action='store_true', default=True, help='enable memory-efficient forward')
     parser.add_argument('--self_ensemble', action='store_true', help='use self-ensemble method for test')
-    
     # Model specifications
     parser.add_argument('--act', type=str, default='relu', help='activation function')
     parser.add_argument('--res_scale', type=float, default=0.1, help='residual scaling')
     parser.add_argument('--dilation', action='store_true', help='use dilated convolution')
     parser.add_argument('--precision', type=str, default='single',
                         choices=('single', 'half'), help='FP precision for test (single | half)')
-    
+
     parser.add_argument('--seed', type=int, default=1, help='random seed')
-    
+
     # Optimization specifications
+    parser.add_argument('--decay', type=str, default='200', help='learning rate decay type')
     parser.add_argument('--gamma', type=float, default=0.5, help='learning rate decay factor for step decay')
     parser.add_argument('--optimizer', default='ADAM',
                         choices=('SGD', 'ADAM', 'RMSprop'),
@@ -81,6 +75,9 @@ def options():
                         help='ADAM epsilon for numerical stability')
     parser.add_argument('--weight_decay', type=float, default=0, help='weight decay')
     parser.add_argument('--gclip', type=float, default=0, help='gradient clipping threshold (0 = no clipping)')
+    
+    # Loss specifications
+    parser.add_argument('--loss', type=str, default='1*L1+1*L2', help='loss function configuration')
     
     args = parser.parse_args()
     
@@ -95,138 +92,14 @@ def options():
     return args
 
 
-def get_data_loader(t, testonly=False):
-    if testonly:
-        loader_train = None
-    
-    if t == 1:
-        if not testonly:
-            loader_train = dataloader.DataLoader(
-                SR(patch_size=args.patch_size, name=testset, train=True,
-                   rootdatapath=srdatapath),
-                batch_size=args.batch_size,
-                shuffle=False,
-                pin_memory=not args.cpu,
-                num_workers=0)
-        loader_test = [dataloader.DataLoader(
-            SR(patch_size=args.patch_size, name=testset, train=False
-               , test_only=testonly, rootdatapath=srdatapath),
-            batch_size=1,
-            shuffle=False,
-            pin_memory=not args.cpu,
-            num_workers=0)]
-    elif t == 2:
-        if not testonly:
-            loader_train = dataloader.DataLoader(
-                Flourescenedenoise(patch_size=args.patch_size, name=testset,
-                                   istrain=True, c=condition, rootdatapath=denoisedatapath),
-                batch_size=args.batch_size,
-                shuffle=False,
-                pin_memory=not args.cpu,
-                num_workers=0,
-            )
-        loader_test = [dataloader.DataLoader(
-            Flourescenedenoise(patch_size=args.patch_size, name=testset, istrain=False,
-                               test_only=test_only, c=condition, rootdatapath=denoisedatapath),
-            batch_size=1,
-            shuffle=False,
-            pin_memory=not args.cpu,
-            num_workers=0,
-        )]
-    elif t == 3:
-        if not testonly:
-            loader_train = dataloader.DataLoader(
-                Flouresceneiso(patch_size=args.patch_size, name=testset, istrain=True,
-                               rootdatapath=isodatapath),
-                batch_size=args.batch_size,
-                shuffle=False,
-                pin_memory=not args.cpu,
-                num_workers=0)
-        loader_test = [dataloader.DataLoader(
-            Flouresceneiso(patch_size=args.patch_size, name=testset, istrain=False,
-                           rootdatapath=isodatapath),
-            batch_size=1,
-            shuffle=False,
-            pin_memory=not args.cpu,
-            num_workers=0)]
-    elif t == 4:
-        if not testonly:
-            loader_train = dataloader.DataLoader(
-                Flouresceneproj(patch_size=args.patch_size, name=testset, istrain=True,
-                                condition=condition, rootdatapath=prodatapath),
-                batch_size=args.batch_size,
-                shuffle=False,
-                pin_memory=not args.cpu,
-                num_workers=0)
-        loader_test = [dataloader.DataLoader(
-            Flouresceneproj(patch_size=args.patch_size, name=testset, istrain=False,
-                            condition=condition, rootdatapath=prodatapath),
-            batch_size=1,
-            shuffle=False,
-            pin_memory=not args.cpu,
-            num_workers=0)]
-    elif t == 5:
-        if not testonly:
-            loader_train = dataloader.DataLoader(
-                FlouresceneVCD(patch_size=args.patch_size, istrain=True, subtestset=subtestset,
-                               test_only=False, rootdatapath=voldatapath),
-                batch_size=args.batch_size,
-                shuffle=False,
-                pin_memory=not args.cpu,
-                num_workers=0)
-        loader_test = [dataloader.DataLoader(
-            FlouresceneVCD(patch_size=args.patch_size, istrain=False, subtestset=subtestset,
-                           test_only=testonly, rootdatapath=voldatapath),
-            batch_size=1,
-            shuffle=False,
-            pin_memory=not args.cpu,
-            num_workers=0)]
-    
-    return loader_train, loader_test
-
-
-def train():
-    _model = model.Model(args, checkpoint, unimodel, epochall=-1, dataper=1.0, rp=rp)
-    _loss = loss.Loss(args, checkpoint)
-    loader_train, loader_test = get_data_loader(t=task)
-    
-    t = Trainer(args, loader_train, loader_test, args.data_test, _model, _loss, checkpoint)
-    while t.terminate():
-        t.trainUni(tsk=task)
-    
-    checkpoint.done()
-
-
-def test():
-    _model = model.Model(args, checkpoint, unimodel, rp=rp)
-    
-    loader_train, loader_test = get_data_loader(t=task, testonly=True)
-    t = Trainer(args, loader_train, loader_test, args.data_test, _model, None, checkpoint)
-    
-    if task == 1:
-        t.testSR()
-    elif task == 2:
-        t.test3Ddenoise(condition=condition, data_test=testset)
-    elif task == 3:
-        t.testiso()
-    elif task == 4:
-        t.testproj(condition=condition)
-    elif task == 5:
-        t.test2to3(subtestset=subtestset)
-
-
-class Trainer():
-    def __init__(self, args, loader_train, loader_test, datasetname, my_model, my_loss, ckp):
+class PreTrainer():
+    def __init__(self, args, my_model, my_loss, ckp):
         self.args = args
-        gpu = torch.cuda.is_available()
-        self.device = torch.device('cpu' if (not gpu) else 'cuda')
+        self.device = torch.device('cpu' if self.args.cpu else 'cuda')
         self.scale = args.scale
-        self.datasetname = datasetname
         self.bestpsnr = 0
         self.bestep = 0
         self.ckp = ckp
-        self.loader_train = loader_train
-        self.loader_test = loader_test
         self.model = my_model
         self.loss = my_loss
         self.optimizer = utility.make_optimizer(args, self.model)
@@ -234,122 +107,143 @@ class Trainer():
         self.normalizerhr = PercentileNormalizer(2, 99.8)
         self.sepoch = args.resume
         self.epoch = 0
-        self.ite = 0
+        self.epoch_tsk5 = 0
+        self.epoch_tsk4 = 0
+        self.test_only = args.test_only
         
         if self.args.load != '':
             self.optimizer.load(ckp.dir, epoch=len(ckp.log))
         
         self.error_last = 1e8
+        rp = os.path.dirname(__file__)
         self.dir = os.path.join(rp, 'experiment', self.args.save)
-        
-        print('Trainer self.dir = ', self.dir)
-        
         os.makedirs(self.dir, exist_ok=True)
         if not self.args.test_only:
-            self.testsave = self.dir + '/Valid-{}/'.format(self.datasetname)
+            self.testsave = self.dir + '/Valid/'
             os.makedirs(self.testsave, exist_ok=True)
-            
-            self.filepsnr = open(self.testsave + "TrainPsnr.txt", 'w')
-            self.filess = open(self.testsave + "TrainSSIM.txt", 'w')
-            self.fileloss = open(self.testsave + "Trainloss.txt", 'w')
+            self.file = open(self.testsave + "TrainPsnr.txt", 'w')
     
-    def trainUni(self, tsk=1):
+    def pretrain(self):
+        self.pslst = []
+        self.sslst = []
+        
         self.loss.step()
         if self.sepoch > 0:
             epoch = self.sepoch
             self.sepoch = 0
+            self.epoch = epoch
         else:
             epoch = self.epoch
-        self.epoch = epoch
-        
-        self.pretrain_epoch_num = 30
-        self.filepsnr.write('epoch ' + str(self.epoch) + '\n')
-        self.filess.write('epoch ' + str(self.epoch) + '\n')
-        self.fileloss.write('epoch ' + str(self.epoch) + '\n')
         
         lr = self.optimizer.get_lr()
         self.ckp.write_log(
             '[Epoch {}]\tLearning rate: {:.2e}'.format(epoch, Decimal(lr)))
         self.loss.start_log()
         timer_data, timer_model = utility.timer(), utility.timer()
-        if tsk == 1:
-            self.model.scale = 2
         
         self.model.train()
+        self.changeTask(t=args.task, subd=-1)
+        
+        if self.tsk == 4: self.epoch_tsk4 += 1
+        if self.tsk == 5: self.epoch_tsk5 += 1
+        
         for batch, (lr, hr, _,) in enumerate(self.loader_train):
             lr, hr = self.prepare(lr, hr)
             timer_data.hold()
             timer_model.tic()
             
             self.optimizer.zero_grad()
-            if (tsk == 1) or (tsk == 2) or (tsk == 3):
-                sr = self.model(lr, tsk)
+            if (self.tsk == 1) or (self.tsk == 2) or (self.tsk == 3):
+                sr = self.model(lr, self.tsk)
                 loss = self.loss(sr, hr)
-            elif tsk == 4:
-                sr_stg1, sr = self.model(lr, tsk)
-                
-                if epoch <= self.pretrain_epoch_num:
+            elif self.tsk == 4:
+                sr_stg1, sr = self.model(lr, self.tsk)
+                if self.epoch_tsk4 <= 30:
                     loss = 0.001 * self.loss(sr_stg1, hr) + self.loss(sr, hr)
                 else:
                     loss = self.loss(sr, hr)
-            elif tsk == 5:
-                sr_stg1, sr = self.model(lr, tsk)
-                
-                if epoch <= self.pretrain_epoch_num:
+            elif self.tsk == 5:
+                sr_stg1, sr = self.model(lr, self.tsk)
+                if self.epoch_tsk5 <= 30:
                     loss = self.loss(sr_stg1, hr)
                 else:
                     loss = 0.1 * self.loss(sr_stg1, hr) + self.loss(sr, hr)
             
             loss.backward()
             if self.args.gclip > 0:
-                utils.clip_grad_value_(
-                    self.model.parameters(), self.args.gclip)
+                utils.clip_grad_value_(self.model.parameters(), self.args.gclip)
             self.optimizer.step()
-            self.fileloss.write(str(loss.cpu().detach().numpy()) + ',')
-            self.fileloss.flush()
-            
             timer_model.hold()
             if batch % self.args.print_every == 0:
                 sr2dim = np.float32(normalize(np.squeeze(sr[0].cpu().detach().numpy()), 0, 100, clip=True)) * 255
                 hr2dim = np.float32(normalize(np.squeeze(hr[0].cpu().detach().numpy()), 0, 100, clip=True)) * 255
                 psm, ssmm = utility.compute_psnr_and_ssim(sr2dim, hr2dim)
                 print('training patch- PSNR/SSIM = %f/%f' % (psm, ssmm))
-            
-            if batch % self.args.test_every == 0:
+                
+                if self.tsk == 4 or self.tsk == 5:
+                    sr2dimu = np.float32(
+                        normalize(np.squeeze(sr_stg1[0].cpu().detach().numpy()), 0, 100, clip=True)) * 255
+                    psm, ssmm = utility.compute_psnr_and_ssim(sr2dimu, hr2dim)
+                    print('sr_stg1 training patch = %f/%f' % (psm, ssmm))
+                
                 print('Batch%d/Epoch%d, Loss = ' % (batch, epoch), loss)
                 print('[{}/{}]\t{}\t{:.1f}+{:.1f}s'.format((batch + 1) * self.args.batch_size,
                                                            len(self.loader_train.dataset),
                                                            self.loss.display_loss(batch),
                                                            timer_model.release(),
                                                            timer_data.release()))
-                
+            
+            timer_data.tic()
+            
+            if batch % self.args.test_every == 0:
                 self.loss.end_log(len(self.loader_train))
                 self.error_last = self.loss.log[-1, -1]
                 self.optimizer.schedule()
-                if tsk == 1:
+                if self.tsk == 1:
                     psnr, ssim = self.testSR(epoch)
-                elif tsk == 2:
-                    psnr, ssim = self.test3Ddenoise(epoch)
-                elif tsk == 3:
+                elif self.tsk == 2:
+                    psnr, ssim = self.test3Ddenoise(epoch, condition=1)
+                elif self.tsk == 3:
                     psnr, ssim = self.testiso(epoch)
-                elif tsk == 4:
+                elif self.tsk == 4:
                     psnr, ssim = self.testproj(epoch)
-                elif tsk == 5:
+                elif self.tsk == 5:
                     psnr, ssim = self.test2to3(epoch)
                 
-                self.filepsnr.write(str(psnr) + ',')
-                self.filess.write(str(ssim) + ',')
-                self.filepsnr.flush()
-                self.filess.flush()
-                print('Evaluation End -- Batch%d/Epoch%d' % (batch, epoch))
+                self.pslst.append(psnr)
+                self.sslst.append(ssim)
+                
                 self.model.train()
                 self.loss.step()
+                lr = self.optimizer.get_lr()
+                print('Evaluation -- Batch%d/Epoch%d' % (batch, epoch))
+                self.ckp.write_log('Batch%d/Epoch%d' % (batch, epoch) +
+                                   '\tLearning rate: {:.2e}'.format(epoch, Decimal(lr)))
                 self.loss.start_log()
-            timer_data.tic()
         
         self.loss.end_log(len(self.loader_train))
         self.error_last = self.loss.log[-1, -1]
         self.optimizer.schedule()
+        
+        self.file.write('Name \n PSNR \n' + str(self.pslst) + '\n SSIM \n' + str(self.sslst))
+        self.model.save(self.dir + '/model/', epoch, is_best=False)
+        self.model.scale = 1
+        print('save model Epoch%d' % epoch, loss)
+    
+    def testall(self, tsk, subd=-1, condition=1):
+        datasetname = self.changeTask(tsk, subd, condition=condition)
+        
+        if tsk == 1:
+            p, s = self.testSR()
+        elif tsk == 2:
+            p, s = self.test3Ddenoise(condition=condition, data_test=datasetname)
+        elif tsk == 3:
+            p, s = self.testiso()
+        elif tsk == 4:
+            p, s = self.testproj(condition=condition)
+        elif tsk == 5:
+            p, s = self.test2to3()
+        return p, s
     
     # # -------------------------- SR --------------------------
     def testSR(self, epoch=0):
@@ -365,9 +259,6 @@ class Trainer():
         
         num = 0
         pslst = []
-        pslstt = []
-        pslst255 = []
-        pslstmax = []
         sslst = []
         nmlst = []
         for idx_data, (lr, hr, filename) in enumerate(self.loader_test[0]):
@@ -388,10 +279,7 @@ class Trainer():
             hr255 = np.float32(normalize(hr, 0, 100, clip=True)) * 255
             ps255, ss255 = utility.compute_psnr_and_ssim(sr255, hr255)
             
-            pslst.append(ps)
-            pslstt.append(pst)
-            pslst255.append(ps255)
-            pslstmax.append(np.max([ps, pst, ps255]))
+            pslst.append(np.max([ps, pst, ps255]))
             sslst.append(ss255)
             print('pst, ps, ss, ps255, ss255 = ', pst, ps, ss, ps255, ss255)
             if self.args.test_only:
@@ -405,19 +293,13 @@ class Trainer():
                 savecolorim(self.testsave + name[:-4] + '-MeandfnoNormC.png', res, norm=False)
         
         psnrmean = np.mean(pslst)
-        psnrmeant = np.mean(pslst)
-        psnrmean255 = np.mean(pslst255)
-        psnrmean = np.max([psnrmean, psnrmeant, psnrmean255])
-        psnrmaxmean = np.mean(pslstmax)
         ssimmean = np.mean(sslst)
         
         if self.args.test_only:
             file = open(self.testsave + "Psnrssim100_norm.txt", 'w')
             file.write('Mean = ' + str(psnrmean) + str(ssimmean))
-            file.write('\nName \n' + str(nmlst) + '\n PSNR t \n' + str(pslstt)
-                       + '\n PSNR \n' + str(pslst)
-                       + '\n PSNR norm255 \n' + str(pslst255)
-                       + '\n PSNR max \n' + str(pslstmax)
+            file.write('\nName \n' + str(nmlst) + '\n PSNR t \n'
+                       + '\n PSNR max \n' + str(pslst)
                        + '\n SSIM \n' + str(sslst))
             file.close()
         else:
@@ -426,8 +308,7 @@ class Trainer():
                 self.bestep = epoch
                 self.model.save(self.dir, epoch, is_best=(self.bestep == epoch))
         
-        print('num SSIM = ', num, ssimmean)
-        print('psnrmean, psnrmeant, psnrmean255, psnrmaxmean = ', psnrmean, psnrmeant, psnrmean255, psnrmaxmean)
+        print('num = ', num, 'psnrmean SSIM = ', psnrmean, ssimmean)
         torch.set_grad_enabled(True)
         return psnrmean, ssimmean
     
@@ -466,7 +347,6 @@ class Trainer():
             lrt = self.normalizer.before(lrt, 'CZYX')  # [0~806] -> [0~1.]
             hrt = self.normalizerhr.before(hrt, 'CZYX')  # [0~806] -> [0~1.]
             lrt, hrt = self.prepare(lrt, hrt)
-            # print('lrt.max.min = 1~0', lrt.max(), lrt.min())
             
             lr = np.squeeze(lrt.cpu().detach().numpy())
             hr = np.squeeze(hrt.cpu().detach().numpy())
@@ -476,7 +356,6 @@ class Trainer():
             batchstep = 5  # 10  #
             inputlst = []
             for ch in range(0, len(hr)):  # [45, 486, 954]  0~44
-                # print(ch)
                 if ch < 5 // 2:  # 0, 1
                     lr1 = [lrt[:, ch:ch + 1, :, :] for _ in range(5 // 2 - ch)]
                     lr1.append(lrt[:, :5 // 2 + ch + 1])
@@ -510,9 +389,6 @@ class Trainer():
             sr255 = np.squeeze(np.float32(normalize(sr, datamin, datamax, clip=True))) * 255  # [0, 1]
             hr255 = np.float32(normalize(hr, datamin, datamax, clip=True)) * 255  # [0, 1]
             lr255 = np.float32(normalize(lr, datamin, datamax, clip=True)) * 255  # [0, 1]
-            # print('sr.shape  denoiseim[0].shape = ', sr.shape, denoiseim[0].shape)  # [1, 2, 100, 100] [1, 1, 100, 100]
-            # print('sr3dnorm.max() .min() = ', sr.max(), sr.min())  # 520.6648 312.37643
-            # P [95,1024,1024] uint16 [0~33000] # T [45, 486, 954]
             
             cpsnrlst = []
             cssimlst = []
@@ -541,7 +417,6 @@ class Trainer():
                         lrpatch255 = lr255[dp, :patchsize, :patchsize]
                         
                         ##  PSNR/SSIM
-                        # mse = np.sum(np.power(srpatch255 - hrpatch255, 2))
                         psm, ssmm = utility.compute_psnr_and_ssim(srpatch255, hrpatch255)
                         psml, ssmml = utility.compute_psnr_and_ssim(lrpatch255, hrpatch255)
                         print('SR Image %s - C%d- PSNR/SSIM/MSE = %f/%f' % (name, dp, psm, ssmm))  # /%f, mse
@@ -744,7 +619,7 @@ class Trainer():
         return psnrm, ssmm
     
     # # -------------------------- Projection --------------------------
-    def testproj(self, epoch=0, condition=0):
+    def testproj(self, epoch=0, condition=2):
         if self.args.test_only:
             self.testsave = self.dir + '/results/model%d/c%d/' % (self.args.resume, condition)
             os.makedirs(self.testsave, exist_ok=True)
@@ -783,6 +658,7 @@ class Trainer():
             hr = np.float32(np.squeeze(hrt.cpu().detach().numpy()))  # [1, 1, h, w]
             
             ##  PSNR/SSIM
+            # 2.(2D norm 0100 PSnr color save)
             hr2dim = np.float32(normalize(hr, datamin, datamax, clip=True)) * 255  # [0, 1]
             sr2dim = np.float32(normalize(np.float32(srtf), datamin, datamax, clip=True)) * 255  # norm_srtf
             sr2dim_stg1 = np.float32(normalize(np.float32(sr_stg1), datamin, datamax, clip=True)) * 255  # norm_srtf
@@ -850,6 +726,7 @@ class Trainer():
             sr = np.float32(a.cpu().detach().numpy())
             srs1 = np.float32(as1.cpu().detach().numpy())
             
+            # [1,649,649,61]
             imsave(self.testsave + name + 'norm.tif', np.squeeze(sr))
             print('Save TIF image \' %s \' ' % (self.testsave + name + '.tif'))
             
@@ -872,6 +749,7 @@ class Trainer():
                             d += 1
                     savecolorim(self.testsave + 'OriIm' + name + '-LR.png', wf2d)
                     
+                    ##  PSNR/SSIM
                     for i in range(0, len(hr), 10):
                         savecolorim(self.testsave + 'OriIm' + name + '-Result%d.png' % i, sr[i])
                         num += 1
@@ -913,7 +791,7 @@ class Trainer():
             else:
                 savecolorim(self.testsave + 'OriIm' + name + '-Result.png', sr[0])
                 savecolorim(self.testsave + 'OriIm' + name + '-HR.png', hr[0])
-                
+                # #  PSNR/SSIM
                 for i in range(0, len(hr), 10):
                     num += 1
                     hr2dim = np.float32(normalize(hr[i], datamin, datamax, clip=True)) * 255  # [0, 1]
@@ -933,16 +811,8 @@ class Trainer():
         ssmeans1 = np.mean(ssimalls1)
         psnrmeans2 = np.mean(psnrall)
         ssmeans2 = np.mean(ssimall)
-        if self.args.test_only:
-            psnrmean = psnrmeans2
-            ssmean = ssmeans2
-        else:
-            if epoch <= self.pretrain_epoch_num:
-                psnrmean = psnrmeans1
-                ssmean = ssmeans1
-            else:
-                psnrmean = psnrmeans2
-                ssmean = ssmeans2
+        psnrmean = psnrmeans2
+        ssmean = ssmeans2
         
         if psnrmean > self.bestpsnr:
             self.bestpsnr = psnrmean
@@ -964,62 +834,146 @@ class Trainer():
         return [_prepare(a) for a in args]
     
     def terminate(self):
-        if self.args.test_only:
+        if self.test_only:
             return False
         else:
             self.epoch = self.epoch + 1
             if self.epoch > self.args.epochs:
-                self.filepsnr.close()
-                self.filess.close()
-                self.fileloss.close()
+                self.file.close()
             return self.epoch <= self.args.epochs
+    
+    def changeTask(self, t=-1, subd=-1, condition=1):
+        if t == -1:
+            self.tsk = random.randint(1, 5)  # 5  #
+        else:
+            self.tsk = t
+        
+        if self.tsk == 1:
+            taskname = ['SR', 'Denoising', 'Isotropic', 'Projection', 'Volume']
+            print('Change Task to ', taskname[self.tsk - 1])
+            self.model.scale = 2
+            print('Load data for SR')
+            srlst = ['F-actin', 'ER', 'Microtubules', 'CCPs']
+            if subd == -1:
+                testset = srlst[random.randint(0, 3)]
+            else:
+                testset = srlst[subd]
+            if not testonly:
+                self.loader_train = dataloader.DataLoader(
+                    SR(scale=2, name=testset, train=True, rootdatapath=srdatapath
+                       , patch_size=args.patch_size, length=20),
+                    batch_size=args.batch_size,
+                    shuffle=True,
+                    pin_memory=not args.cpu,
+                    num_workers=0)
+            self.loader_test = [dataloader.DataLoader(
+                SR(scale=2, name=testset, train=False, test_only=args.test_only,
+                   rootdatapath=srdatapath, patch_size=args.patch_size, length=20),
+                batch_size=1,
+                shuffle=False,
+                pin_memory=not args.cpu,
+                num_workers=0)]
+        elif self.tsk == 2:
+            nlst = ['Denoising_Planaria', 'Denoising_Tribolium', 'Synthetic_tubulin_granules', 'Synthetic_tubulin_gfp']
+            if subd == -1:
+                testset = nlst[random.randint(0, 1)]
+            else:
+                testset = nlst[subd]
+            if not testonly:
+                self.loader_train = dataloader.DataLoader(
+                    Flourescenedenoise(name=testset, istrain=True, c=condition, rootdatapath=denoisedatapath,
+                                       patch_size=args.patch_size, length=2000),
+                    batch_size=args.batch_size, shuffle=True, pin_memory=not args.cpu, num_workers=0)
+            self.loader_test = [dataloader.DataLoader(
+                Flourescenedenoise(name=testset, istrain=False, c=condition, rootdatapath=denoisedatapath,
+                                   test_only=args.test_only, patch_size=args.patch_size, length=2000),
+                batch_size=1, shuffle=False, pin_memory=not args.cpu, num_workers=0)]
+        elif self.tsk == 3:
+            # isotropic
+            testset = 'Isotropic_Liver'
+            self.loader_test = [dataloader.DataLoader(
+                Flouresceneiso(name=testset, istrain=False, rootdatapath=isodatapath, patch_size=args.patch_size,
+                               test_only=args.test_only, length=2000),
+                batch_size=1,
+                shuffle=False,
+                pin_memory=not args.cpu,
+                num_workers=0)]
+            if not testonly:
+                self.loader_train = dataloader.DataLoader(
+                    Flouresceneiso(name=testset, istrain=True, rootdatapath=isodatapath, patch_size=args.patch_size,
+                                   length=2000),
+                    batch_size=args.batch_size,
+                    shuffle=True,
+                    pin_memory=not args.cpu,
+                    num_workers=0)
+        elif self.tsk == 4:
+            # projection
+            testset = 'Projection_Flywing'
+            self.loader_test = [dataloader.DataLoader(
+                Flouresceneproj(name=testset, istrain=False, condition=condition, test_only=args.test_only,
+                                rootdatapath=prodatapath, patch_size=args.patch_size, length=2000),
+                batch_size=1,
+                shuffle=False,
+                pin_memory=not args.cpu,
+                num_workers=0)]
+            if not testonly:
+                self.loader_train = dataloader.DataLoader(
+                    Flouresceneproj(name=testset, istrain=True, condition=condition,
+                                    rootdatapath=prodatapath, patch_size=args.patch_size, length=2000),
+                    batch_size=args.batch_size,
+                    shuffle=True,
+                    pin_memory=not args.cpu,
+                    num_workers=0)
+        elif self.tsk == 5:
+            print('Load data for volumetric reconstruction')
+            # 2D to 3D
+            testset = 'to_predict'
+            self.loader_test = [dataloader.DataLoader(
+                FlouresceneVCD(istrain=False, subtestset=testset, test_only=args.test_only,
+                               rootdatapath=voldatapath, patch_size=args.patch_size, length=2000),
+                batch_size=1,
+                shuffle=False,
+                pin_memory=not args.cpu,
+                num_workers=0)]
+            if not testonly:
+                self.loader_train = dataloader.DataLoader(
+                    FlouresceneVCD(istrain=True, subtestset=testset, test_only=False,
+                                   rootdatapath=voldatapath,
+                                   patch_size=args.patch_size, length=2000),
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    pin_memory=not args.cpu,
+                    num_workers=0)
+        
+        return testset
 
 
 if __name__ == '__main__':
-    task = 1
-    test_only = False  # True  #
-    pre_train = './experiment/Uni-SwinIR/model_best.pt'
-    
-    test_every = 1000
     srdatapath = '/home/user2/dataset/microscope/CSB/DataSet/BioSR_WF_to_SIM/DL-SR-main/dataset/'
     denoisedatapath = '/home/user2/dataset/microscope/CSB/DataSet/'
     isodatapath = '/home/user2/dataset/microscope/CSB/DataSet/Isotropic/'
     prodatapath = '/home/user2/dataset/microscope/CSB/DataSet/'
     voldatapath = '/home/user2/dataset/microscope/VCD/vcdnet/'
     
-    if task == 1:  # SR
-        testset = 'ER'  # 'CCPs'  # 'Microtubules'  # 'F-actin'  #
-        batch = 1
-        patch = 128
-    elif task == 2:  # denoise
-        condition = 1
-        patch = 64
-        batch = 32
-        testset = 'Denoising_Planaria'  # testset = 'Denoising_Tribolium'
-    elif task == 3:  # isotropic
-        testset = 'Isotropic_Liver'
-        batch = 32
-        patch = 128
-    elif task == 4:  # projection
-        condition = 2
-        batch = 4
-        patch = 64
-        testset = 'Projection_Flywing'
-    elif task == 5:  # 2D to 3D
-        batch = 4
-        patch = 64
-        testset = 'VCD'
-        subtestset = 'to_predict'
-    
-    savename = 'Uni-SwinIR%s/' % testset
+    pretrain = '.'
+    testonly = False  # True  #
     
     args = options()
     torch.manual_seed(args.seed)
     checkpoint = utility.checkpoint(args)
     assert checkpoint.ok
+    unimodel = model.UniModel(args, tsk=-1)
+
+    _model = model.Model(args, checkpoint, unimodel)
+
+    _loss = loss.Loss(args, checkpoint) if not args.test_only else None
+    t = PreTrainer(args, _model, _loss, checkpoint)
     
-    unimodel = model.UniModel(args, tsk=task)
-    if not test_only:
-        train()
+    if testonly:
+        for i in range(0, 4):
+            t.testall(tsk=1, subd=i)
     else:
-        test()
+        while t.terminate():
+            t.pretrain()
+    
+    checkpoint.done()

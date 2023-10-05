@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+import model.attention as attention
+import model.common as common
 
 
 class swinir(nn.Module):
@@ -639,8 +641,16 @@ class RSTB(nn.Module):
         self.patch_unembed = PatchUnEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim,
             norm_layer=None)
+        
+        self.pruned = False
+        
+    def prune(self):
+        self.pruned = True
 
     def forward(self, x, x_size):
+        if self.pruned:
+            return x
+        
         y = self.residual_group(x, x_size)
         y1 = self.patch_unembed(y, x_size)
         y2 = self.patch_embed(self.conv(y1))
@@ -867,13 +877,9 @@ class UNetA(nn.Module):
         return x
 
 
-import model.attention as attention
-import model.common as common
-
-
-class ENLCN(nn.Module):
+class Projhead(nn.Module):
     def __init__(self, args, conv=common.default_conv):
-        super(ENLCN, self).__init__()
+        super(Projhead, self).__init__()
         
         n_resblock = args.n_resblocks
         inch = args.inch

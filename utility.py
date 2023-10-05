@@ -1,12 +1,6 @@
 import sys
 sys.path.append('../')
-from csbdeep.func import IS_TF_1, savecolorim
-
-if IS_TF_1:
-    from skimage.measure import compare_psnr, compare_ssim
-else:
-    from skimage.metrics import structural_similarity as compare_ssim
-    from skimage.metrics import peak_signal_noise_ratio as compare_psnr
+from csbdeep.func import savecolorim, savecolorim1, compare_ssim, compare_psnr
 import os
 import math
 import time
@@ -160,7 +154,7 @@ def compute_psnr_and_ssim(image1, image2, border_size=0):
         image2 = image2.reshape(image2.shape[0], image2.shape[1], 1)
     
     if image1.shape[0] != image2.shape[0] or image1.shape[1] != image2.shape[1] or image1.shape[2] != image2.shape[2]:
-        return None
+        print('Error ! as image1.shape != image2.shape')
     
     if border_size > 0:
         image1 = image1[border_size:-border_size, border_size:-border_size, :]
