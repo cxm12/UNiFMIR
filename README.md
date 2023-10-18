@@ -3,7 +3,7 @@ Pre-training a Foundation Model for Universal Fluorescence Microscopy Image Rest
 
 ## Online Demo
 
-We provide a live demo for UniFMIR at [http://unifmir.fdudml.cn/](http://unifmir.fdudml.cn/). Or you can employ the following steps to run the demo locally.
+We provide a live demo for UniFMIR at [http://unifmir.fdudml.cn/](http://unifmir.fdudml.cn/). You can also use the colab <a target="_blank" href="https://colab.research.google.com/github/cxm12/UNiFMIR/blob/main/UniFMIR.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a> or employ the following steps to run the demo locally.
 
 ![demo](./demo.jpg)
 
