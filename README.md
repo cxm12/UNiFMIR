@@ -68,6 +68,7 @@ matplotlib       ==          3.5.0
 protobuf         ==          3.20.3
 einops           ==          0.6.0
 timm             ==          0.6.11
+gradio           ==          3.40.1
 ```
 
 3. Run the Web Interface
