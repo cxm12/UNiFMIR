@@ -4,7 +4,7 @@ import random
 import imageio
 from tifffile import imread, imsave
 
-import os
+import os, cv2
 from tqdm import tqdm
 import torch
 import utility
@@ -73,7 +73,7 @@ class Args:
     split_batch = 1
     gan_k = 1
 
-def load_model(type, device, chop, quantization, progress=gr.Progress()):
+def load_model(type, device, chop, quantization, skip, progress=gr.Progress()):
     global MODEL, ARGS
 
     ARGS = Args()
@@ -101,6 +101,7 @@ def load_model(type, device, chop, quantization, progress=gr.Progress()):
         ARGS.patch_size = 128
         ARGS.scale = '2'
         ARGS.inch = 1
+        # ARGS.chop = False
 
         if type == 'SR_F-actin':
             ARGS.save = 'SwinIRF-actin'
@@ -182,7 +183,13 @@ def load_model(type, device, chop, quantization, progress=gr.Progress()):
     MODEL = model.Model(ARGS, checkpoint)
     MODEL.eval()
 
-    return '%s Model loaded on %s with %s precision and chop %s'%(type, device, quantization, 'enabled' if ARGS.chop else 'disabled')
+    if skip == 'Yes' and ARGS.n_GPUs <= 1:
+        if 'Projection' in type:
+            MODEL.model.denoise.layers[1].prune()
+        else:
+            MODEL.model.layers[1].prune()
+
+    return '%s Model loaded on %s with %s precision'%(type, device, quantization)
 
 def visualize(img_input, progress=gr.Progress()):
     print(f'Opening {img_input.name}...')
@@ -191,16 +198,17 @@ def visualize(img_input, progress=gr.Progress()):
         return None
     
     image = imread(img_input.name)
-    print(f'Image shape: {image.shape}')
+    shape = image.shape
+    print(f'Image shape: {shape}')
 
-    if len(image.shape) == 2:
+    if len(shape) == 2:
         image = utility.savecolorim(None, image, norm=True)
-        return [[image], f'2D image loaded with shape {image.shape}']
-    elif len(image.shape) == 3:
+        return [[image], f'2D image loaded with shape {shape}']
+    elif len(shape) == 3:
         clips = []
-        for i in range(image.shape[0]):
+        for i in range(shape[0]):
             clips.append(utility.savecolorim(None, image[i], norm=True))
-        return [clips, f'3D image loaded with shape {image.shape}']
+        return [clips, f'3D image loaded with shape {shape}']
     else:
         gr.Error("Image must be 2 or 3 dimensional!")
         return None
@@ -300,8 +308,27 @@ def _load_imgs(img_file, t2d=True):
     # print('\r%s : %s' % (img_file, str(img.shape)), end='')
     return img
 
+def run_model_corr(img_input, type, corr, progress=gr.Progress()):
+    img, axes = run_model(img_input, type)
+
+    if img is None:
+        return [None, None]
+    
+    if corr == 'Yes':
+        img_rs, axes = run_model(img_input, type, resize=True)
+        print("corr", img.shape, img_rs.shape)
+        if len(img.shape) == 3:
+            img_rs = img_rs.transpose(1, 2, 0)
+        img_rs = cv2.resize(img_rs, (img.shape[-1], img.shape[-2]), interpolation=cv2.INTER_CUBIC)
+        if len(img.shape) == 3:
+            img_rs = img_rs.transpose(2, 0, 1)
+        img = (img + img_rs) / 2
+
+    utility.save_tiff_imagej_compatible('output.tif', img, axes)
+    return ['output.tif', "Output Successfully Saved!"]
+
 @torch.no_grad()
-def run_model(img_input, type, progress=gr.Progress()):
+def run_model(img_input, type, resize=False):
     global MODEL, ARGS
     
     if MODEL is None:
@@ -315,7 +342,7 @@ def run_model(img_input, type, progress=gr.Progress()):
     print(f'Opening {img_input.name}...')
     if not img_input.name.endswith('.tif'):
         gr.Error("Image must be a tiff file!")
-        return None
+        return [None, None]
     
     normalizer = PercentileNormalizer(2, 99.8)
 
@@ -330,6 +357,9 @@ def run_model(img_input, type, progress=gr.Progress()):
         lr = normalize(image, ARGS.datamin, ARGS.datamax, clip=True) * ARGS.rgb_range
         lr = torch.from_numpy(lr).unsqueeze(0).unsqueeze(0).float()
 
+        if resize:
+            lr = torch.nn.functional.interpolate(lr, scale_factor=1/2, mode='bicubic', align_corners=True)
+
         # model inference
         sr = MODEL(lr.to(MODEL.device), 0)
 
@@ -337,14 +367,14 @@ def run_model(img_input, type, progress=gr.Progress()):
         sr = utility.quantize(sr, ARGS.rgb_range)
 
         # convert to numpy
-        sr = sr.squeeze(0).squeeze(0).cpu().detach().numpy()
+        sr = sr.float().squeeze(0).squeeze(0).cpu().detach().numpy()
 
         # save image
-        imsave('output.tif', sr)
+        # imsave('output.tif', sr)
 
         # visualize
-        sr_norm = utility.savecolorim(None, sr, norm=True)
-        return ['output.tif', [sr_norm]]
+        # sr_norm = utility.savecolorim(None, sr, norm=True)
+        return [sr, "YX"]
 
     elif 'Denoising' in type:
         print(f'Opening {img_input.name}...')
@@ -360,6 +390,8 @@ def run_model(img_input, type, progress=gr.Progress()):
 
         # model inference
         denoiseim = torch.zeros_like(lrt, dtype=lrt.dtype)
+        if resize:
+            denoiseim = torch.nn.functional.interpolate(denoiseim, scale_factor=1/2, mode='bicubic', align_corners=True)
         batchstep = ARGS.n_GPUs * 4
         inputlst = []
         for ch in range(0, lrt.shape[1]):  # [45, 486, 954]  0~44
@@ -384,6 +416,9 @@ def run_model(img_input, type, progress=gr.Progress()):
                 dp = len(inputlst) - batchstep
             print(dp)  # 0, 10, .., 90
             lrtn = torch.concat(inputlst[dp:dp + batchstep], 0)  # [batch, inputchannel, h, w]
+            if resize:
+                lrtn = torch.nn.functional.interpolate(lrtn, scale_factor=1/2, mode='bicubic', align_corners=True)
+
             a = MODEL(lrtn, 0)
             a = torch.transpose(a, 1, 0)  # [1, batch, h, w]
             denoiseim[:, dp:dp + batchstep, :, :] = a
@@ -391,14 +426,14 @@ def run_model(img_input, type, progress=gr.Progress()):
         # normalize to 0-1
         sr = np.float32(denoiseim.cpu().detach().numpy())
         sr = np.squeeze(normalizer.after(sr))
-        imsave('output.tif', sr)
+        # imsave('output.tif', sr)
         
         # save image
-        sr_norm = np.squeeze(np.float32(normalize(sr, ARGS.datamin, ARGS.datamax, clip=True)))
-        clips = []
-        for i in range(sr_norm.shape[0]):
-            clips.append(utility.savecolorim(None, sr_norm[i], norm=True))
-        return ['output.tif', clips]
+        # sr_norm = np.squeeze(np.float32(normalize(sr, ARGS.datamin, ARGS.datamax, clip=True)))
+        # clips = []
+        # for i in range(sr_norm.shape[0]):
+        #     clips.append(utility.savecolorim(None, sr_norm[i], norm=True))
+        return [sr, "CYX"]
     
     elif 'Isotropic' in type:
         image = imread(img_input.name)
@@ -432,7 +467,11 @@ def run_model(img_input, type, progress=gr.Progress()):
             return res
 
         isoim1 = np.zeros_like(lr, dtype=np.float32)
+        if resize:
+            isoim1 = torch.nn.functional.interpolate(isoim1, scale_factor=1/2, mode='bicubic', align_corners=True)
         isoim2 = np.zeros_like(lr, dtype=np.float32)
+        if resize:
+            isoim2 = torch.nn.functional.interpolate(isoim2, scale_factor=1/2, mode='bicubic', align_corners=True)
 
         batchstep = ARGS.n_GPUs * 4
         for wp in tqdm(range(0, lr.shape[2], batchstep)):
@@ -444,6 +483,10 @@ def run_model(img_input, type, progress=gr.Progress()):
             x_rot1 = np.expand_dims(np.squeeze(x_rot1), 1)
 
             x_rot1 = torch.from_numpy(np.ascontiguousarray(x_rot1)).float()
+
+            if resize:
+                x_rot1 = torch.nn.functional.interpolate(x_rot1, scale_factor=1/2, mode='bicubic', align_corners=True)
+
             a1 = MODEL(x_rot1.to(MODEL.device), 0)
 
             # [w=batchstep, 1, h, d] -> [w=batchstep, h, d] -> [w=batchstep, h, d, 1]
@@ -462,6 +505,10 @@ def run_model(img_input, type, progress=gr.Progress()):
             x_rot2 = np.expand_dims(np.squeeze(x_rot2), 1)
 
             x_rot2 = torch.from_numpy(np.ascontiguousarray(x_rot2)).float()
+
+            if resize:
+                x_rot2 = torch.nn.functional.interpolate(x_rot2, scale_factor=1/2, mode='bicubic', align_corners=True)
+
             a2 = MODEL(x_rot2.to(MODEL.device), 0)
 
             # [h=batchstep, 1, w, d] -> [h=batchstep, w, d] -> [h=batchstep, w, d, 1]
@@ -471,15 +518,15 @@ def run_model(img_input, type, progress=gr.Progress()):
             isoim2[:, hp:hp + batchstep, :, :] = u2
 
         sr = np.sqrt(np.maximum(isoim1, 0) * np.maximum(isoim2, 0))
-        sr = np.squeeze(normalizer.after(sr))
-        imsave('output.tif', sr)
+        sr = np.float32(np.squeeze(normalizer.after(sr)))
+        # imsave('output.tif', sr)
 
         # save image
-        sr_norm = np.squeeze(np.float32(normalize(sr, ARGS.datamin, ARGS.datamax, clip=True)))
-        clips = []
-        for i in range(sr_norm.shape[0]):
-            clips.append(utility.savecolorim(None, sr_norm[i], norm=True))
-        return ['output.tif', clips]
+        # sr_norm = np.squeeze(np.float32(normalize(sr, ARGS.datamin, ARGS.datamax, clip=True)))
+        # clips = []
+        # for i in range(sr_norm.shape[0]):
+        #     clips.append(utility.savecolorim(None, sr_norm[i], norm=True))
+        return [sr, "CYX"]
     
     elif 'Projection' in type:
         image = imread(img_input.name)
@@ -490,19 +537,23 @@ def run_model(img_input, type, progress=gr.Progress()):
 
         # expand to 4 dimensions tensor
         lr = torch.from_numpy(image.astype(np.float32)).unsqueeze(0)
+
+        if resize:
+            lr = torch.nn.functional.interpolate(lr, scale_factor=1/2, mode='bicubic', align_corners=True)
+
         a = MODEL(lr.to(MODEL.device), 0)
         sr = np.float32(np.squeeze(a[0].cpu().detach().numpy()))
 
         # save image
-        print(sr.shape)
+        # print(sr.shape)
         srtf = np.squeeze(sr)
-        axes_restored = 'YX'
-        utility.save_tiff_imagej_compatible('output.tif', srtf, axes_restored)
+        # axes_restored = 'YX'
+        # utility.save_tiff_imagej_compatible('output.tif', srtf, axes_restored)
 
         # visualize
-        sr_norm = np.squeeze(np.float32(normalize(srtf, ARGS.datamin, ARGS.datamax, clip=True)))
-        sr_norm = utility.savecolorim(None, sr_norm, norm=True)
-        return ['output.tif', [sr_norm]]
+        # sr_norm = np.squeeze(np.float32(normalize(srtf, ARGS.datamin, ARGS.datamax, clip=True)))
+        # sr_norm = utility.savecolorim(None, sr_norm, norm=True)
+        return [srtf, "YX"]
     
     elif 'Volumetric' in type:
         image = imread(img_input.name)
@@ -516,19 +567,22 @@ def run_model(img_input, type, progress=gr.Progress()):
         lr = np.transpose(lr, (2, 0, 1))[None, ...]
         lr = torch.from_numpy(np.ascontiguousarray(lr * ARGS.rgb_range)).float()
 
+        if resize:
+            lr = torch.nn.functional.interpolate(lr, scale_factor=1/2, mode='bicubic', align_corners=True)
+
         # model inference
         a = MODEL(lr.to(MODEL.device), 0)
         sr = np.float32(a.cpu().detach().numpy())
 
         # save image
         sr_norm = (np.clip(np.squeeze(sr), -1, 1) + 1) / 2 
-        imsave('output.tif', sr_norm)
+        # imsave('output.tif', sr_norm)
 
-        # visualize
-        clips = []
-        for i in range(sr_norm.shape[0]):
-            clips.append(utility.savecolorim(None, sr_norm[i], norm=True))
-        return ['output.tif', clips]
+        # # visualize
+        # clips = []
+        # for i in range(sr_norm.shape[0]):
+        #     clips.append(utility.savecolorim(None, sr_norm[i], norm=True))
+        return [sr_norm, "CYX"]
 
     else:
         gr.Error("This task is not supported yet!")
@@ -540,13 +594,14 @@ with gr.Blocks() as demo:
     gr.Markdown("This demo allows you to run the models on your own images or the examples  from the paper. Please refer to the paper for more details.")
 
     gr.Markdown("## Instructions")
-    gr.Markdown("1. Upload your tiff image or use the examples below. We accept 2 (xy) dimensional images for SR and Volumetric Reconstruction and 3 (zxy) dimensional images for Denoising, Projection and Isotropic.")
+    gr.Markdown("1. Upload your tiff image or use the examples below. We accept 2 (xy) dimensional images for SR and Volumetric Reconstruction and 3 (zxy) dimensional images for Denoising, Projection and Isotropic Reconstruction.")
     gr.Markdown("2. Click 'Check Input' to inspect your input image. This may take a while to display the image.")
-    gr.Markdown("3. Select the device and quantization you want to run the model on. We support CPU, GPU, and multiple GPUs. Float16 will save time and memory with almost no performance drop. You can also choose to chop the image into smaller patches to save memory.")
-    gr.Markdown("4. Select the model you want to run. We provide models for different tasks and datasets, including SR (CCPs, ER, Microtubules, F-actin), Denoising (Planaria, Tribolium),Isotropic (Liver), Projection (Flywing), Volumetric (VCD).")
-    gr.Markdown("5. Click 'Load Model' to load the model. This may take a while.")
-    gr.Markdown("6. Click 'Restore Image' to run the model on the input image. Some tasks like denoising will take several minutes to run.")
-    gr.Markdown("7. The output image will be saved as 'output.tif' for download.")
+    gr.Markdown("3. Select the model you want to run. We provide models for different tasks and datasets, including SR (CCPs, ER, Microtubules, F-actin), Denoising (Planaria, Tribolium),Isotropic (Liver), Projection (Flywing), Volumetric (VCD).")
+    gr.Markdown("3. Select the device and quantization you want to run the model on. We support CPU, GPU, and multiple GPUs. Float16 will save time and memory with almost no performance drop.")
+    gr.Markdown("5. Select the model options. You can choose to chop the image into smaller patches to save memory. Pixel size correction will take longer to run but may produce better results with large input resolution. Fast inference will skip one Swin block to accelerate but may result in some performance drop.")
+    gr.Markdown("6. Click 'Load Model' to load the model. This may take a while.")
+    gr.Markdown("7. Click 'Restore Image' to run the model on the input image. Some tasks like denoising will take several minutes to run. The output image will be saved as 'output.tif' for download.")
+    gr.Markdown("8. Click 'Check Output' to inspect the output image. This may take a while to display the image.")
 
     with gr.Row():
         with gr.Column():
@@ -557,7 +612,7 @@ with gr.Blocks() as demo:
                 img_visual = gr.Gallery(label="Input Viusalization", interactive=False)
 
             with gr.Row():
-                load_image = gr.Textbox(label="Image Information", value="Image not loaded")
+                input_message = gr.Textbox(label="Image Information", value="Image not loaded")
                 check_input = gr.Button("Check Input") 
 
             with gr.Row():
@@ -569,7 +624,7 @@ with gr.Blocks() as demo:
                             ["exampledata/BioSR/CCP.tif",'SR'],
                             ["exampledata/BioSR/F-actin.tif",'SR'],
                         ],
-                        inputs=[img_input, load_image],
+                        inputs=[img_input, input_message],
                     )
 
                     gr.Examples(
@@ -577,7 +632,7 @@ with gr.Blocks() as demo:
                         examples=[
                             ["exampledata/Isotropic/Liver.tif",'Isotropic'],
                         ],
-                        inputs=[img_input, load_image],
+                        inputs=[img_input, input_message],
                     )
 
                     gr.Examples(
@@ -585,7 +640,7 @@ with gr.Blocks() as demo:
                         examples=[
                             ["exampledata/Proj/Flywing.tif","Projection"],
                         ],
-                        inputs=[img_input, load_image],
+                        inputs=[img_input, input_message],
                     )
 
                 with gr.Column():
@@ -599,7 +654,7 @@ with gr.Blocks() as demo:
                             ["exampledata/Denoise/T/C2/Tribolium_C2.tif","Denoising"],
                             ["exampledata/Denoise/T/C3/Tribolium_C3.tif","Denoising"],
                         ],
-                        inputs=[img_input, load_image],
+                        inputs=[img_input, input_message],
                     )
 
                     gr.Examples(
@@ -607,7 +662,7 @@ with gr.Blocks() as demo:
                         examples=[
                             ["exampledata/volumetricRec/VCD.tif","Volumetric"],
                         ],
-                        inputs=[img_input, load_image],
+                        inputs=[img_input, input_message],
                     )
 
         with gr.Column():
@@ -616,20 +671,29 @@ with gr.Blocks() as demo:
             img_output = gr.Gallery(label="Output Visualiztion")
 
             with gr.Row():
+                type = gr.Dropdown(label="Model Type", choices=TASKS, value="SR_Microtubules")
                 device = gr.Dropdown(label="Device", choices=DEVICES, value="CUDA")
                 quantization = gr.Dropdown(label="Quantization", choices=QUANT, value="float16")
-                chop = gr.Dropdown(label="Chop", choices=['Yes','No'], value="Yes")
 
             with gr.Row():
-                type = gr.Dropdown(label="Model Type", choices=TASKS, value="SR_Microtubules")
-                load_btn = gr.Button("Load Model")
-                
+                chop = gr.Dropdown(label="Chop", choices=['Yes','No'], value="Yes")
+                corr = gr.Dropdown(label="Pixel Size Correction", choices=['Yes','No'], value="No")
+                skip = gr.Dropdown(label="Fast Inference", choices=['Yes','No'], value="No")
+
             with gr.Row():
                 load_progress = gr.Textbox(label="Model Information", value="Model not loaded")
+                load_btn = gr.Button("Load Model")
                 run_btn = gr.Button("Restore Image")
+                
+            with gr.Row():
+                output_message = gr.Textbox(label="Output Information", value="Image not loaded")
+                display_btn = gr.Button("Check Output")
 
-    check_input.click(visualize, inputs=img_input, outputs=[img_visual,load_image], queue=True)
-    load_btn.click(load_model,inputs=[type, device, chop, quantization],outputs=load_progress, queue=True)
-    run_btn.click(run_model, inputs=[img_input, type], outputs=[output_file, img_output], queue=True)
+    gr.Markdown("Internet Content Provider ID: [沪ICP备2023024810号-1](https://beian.miit.gov.cn/)", rtl=True)
+
+    check_input.click(visualize, inputs=img_input, outputs=[img_visual, input_message], queue=True)
+    display_btn.click(visualize, inputs=output_file, outputs=[img_output, output_message], queue=True)
+    load_btn.click(load_model,inputs=[type, device, chop, quantization, skip],outputs=load_progress, queue=True)
+    run_btn.click(run_model_corr, inputs=[img_input, type, corr], outputs=[output_file, output_message], queue=True)
 
 demo.queue().launch(server_name='0.0.0.0')

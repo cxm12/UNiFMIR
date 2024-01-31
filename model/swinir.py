@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from model.enlcn import ENLCN
-
+from typing import Optional, Tuple
 
 def make_model(args):
     try:
@@ -150,12 +150,16 @@ class swinir(nn.Module):
     def forward_features(self, x):
         x_size = (x.shape[2], x.shape[3])
         x = self.patch_embed(x)
-        if self.ape:
-            x = x + self.absolute_pos_embed
+        # if self.ape:
+        #     x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
 
-        for layer in self.layers:
+        import time
+        torch.cuda.synchronize()
+        st = time.time()
+        for i,layer in enumerate(self.layers):
             x = layer(x, x_size)
+            print('RSTB', i, time.time() - st)
             
         x = self.norm(x)  # B L C
         x = self.patch_unembed(x, x_size)
@@ -170,10 +174,20 @@ class swinir(nn.Module):
         x = self.check_image_size(x)
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
+
+        import time
+        torch.cuda.synchronize()
+        st = time.time()
         
         # for classical SR
         x = self.conv_first(x)
+        torch.cuda.synchronize()
+        print('conv_first', time.time() - st)
+
         x = self.conv_after_body(self.forward_features(x)) + x
+
+        torch.cuda.synchronize()
+        print('forward_features', time.time() - st)
         x = self.conv_before_upsample(x)
         
         if self.upscale == 11:
@@ -184,6 +198,9 @@ class swinir(nn.Module):
         else:
             x = self.upsample(x)
         x = self.conv_last(x)
+
+        torch.cuda.synchronize()
+        print('conv_last', time.time() - st)
         x = x / self.img_range + self.mean
         
         return x[:, :, :H * self.upscale, :W * self.upscale]
@@ -222,8 +239,17 @@ class swinirProj_stage2(nn.Module):
             x = self.denoise(x2d) + x2d
             return x2d, x, closs
         else:
+            import time
+            torch.cuda.synchronize()
+            st = time.time()
+
             x2d = self.project(x)
+            torch.cuda.synchronize()
+            print('project', time.time() - st)
+
             x = self.denoise(x2d) + x2d
+            torch.cuda.synchronize()
+            print('denoise', time.time() - st)
             return x2d, x
 
 
@@ -343,11 +369,24 @@ class swinir2dto3d(nn.Module):
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
         
+        import time
+        torch.cuda.synchronize()
+        st = time.time()
+
         xunet = self.conv_first0(x)
         x = self.conv_first(xunet)
+
+        torch.cuda.synchronize()
+        print('conv_first', time.time() - st)
         x = self.conv_after_body(self.forward_features(x))  # + x
+
+        torch.cuda.synchronize()
+        print('forward_features', time.time() - st)
         x = self.conv_before_upsample(x)
         x = self.conv_last(x)
+
+        torch.cuda.synchronize()
+        print('conv_last', time.time() - st)
         x = x / self.img_range + self.mean
         
         return xunet, x
@@ -375,7 +414,7 @@ class Mlp(nn.Module):
         return x
 
 
-def window_partition(x, window_size):
+def window_partition(x: torch.Tensor, window_size: int):
     """
     Args:
         x: (B, H, W, C)
@@ -390,7 +429,7 @@ def window_partition(x, window_size):
     return windows
 
 
-def window_reverse(windows, window_size, H, W):
+def window_reverse(windows, window_size: int, H: int, W: int):
     """
     Args:
         windows: (num_windows*B, window_size, window_size, C)
@@ -456,7 +495,7 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask: Optional[torch.Tensor]):
         """
         Args:
             x: input features with shape of (num_windows*B, N, C)
@@ -558,20 +597,20 @@ class SwinTransformerBlock(nn.Module):
 
         self.register_buffer("attn_mask", attn_mask)
 
-    def calculate_mask(self, x_size):
+    def calculate_mask(self, x_size: Tuple[int, int]):
         # calculate attention mask for SW-MSA
-        H, W = x_size
-        img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
-        h_slices = (slice(0, -self.window_size),
-                    slice(-self.window_size, -self.shift_size),
-                    slice(-self.shift_size, None))
-        w_slices = (slice(0, -self.window_size),
-                    slice(-self.window_size, -self.shift_size),
-                    slice(-self.shift_size, None))
+        H, W = int(x_size[0]), int(x_size[1])
+        img_mask = torch.zeros(size=[1, H, W, 1])  # 1 H W 1
+        h_slices = ((0, -self.window_size),
+                    (-self.window_size, -self.shift_size),
+                    (-self.shift_size, None))
+        w_slices = ((0, -self.window_size),
+                    (-self.window_size, -self.shift_size),
+                    (-self.shift_size, None))
         cnt = 0
         for h in h_slices:
             for w in w_slices:
-                img_mask[:, h, w, :] = cnt
+                img_mask[:, h[0]:h[1], w[0]:w[1], :] = cnt
                 cnt += 1
 
         mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
@@ -581,8 +620,8 @@ class SwinTransformerBlock(nn.Module):
 
         return attn_mask.to(self.mlp.fc1.weight.dtype)
 
-    def forward(self, x, x_size):
-        H, W = x_size
+    def forward(self, x, x_size: Tuple[int, int]):
+        H, W = x_size[0], x_size[1]
         B, L, C = x.shape
         # assert L == H * W, "input feature has wrong size"
 
@@ -739,11 +778,11 @@ class BasicLayer(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, x, x_size):
+    def forward(self, x, x_size: Tuple[int,int]):
         for blk in self.blocks:
-            if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x, x_size)
-            else:
+            # if self.use_checkpoint:
+            #     x = checkpoint.checkpoint(blk, x, x_size)
+            # else:
                 x = blk(x, x_size)
         if self.downsample is not None:
             x = self.downsample(x)
@@ -822,8 +861,16 @@ class RSTB(nn.Module):
         self.patch_unembed = PatchUnEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim,
             norm_layer=None)
+        
+        self.pruned = False
+        
+    def prune(self):
+        self.pruned = True
 
-    def forward(self, x, x_size):
+    def forward(self, x, x_size: Tuple[int,int]):
+        if self.pruned:
+            return x
+        
         y = self.residual_group(x, x_size)
         y1 = self.patch_unembed(y, x_size)
         y2 = self.patch_embed(self.conv(y1))
@@ -907,7 +954,7 @@ class PatchUnEmbed(nn.Module):
         self.in_chans = in_chans
         self.embed_dim = embed_dim
 
-    def forward(self, x, x_size):
+    def forward(self, x, x_size: Tuple[int,int]):
         B, HW, C = x.shape
         x = x.transpose(1, 2).view(B, self.embed_dim, x_size[0], x_size[1])  # B Ph*Pw C
         return x

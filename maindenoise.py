@@ -21,6 +21,7 @@ def options():
     parser.add_argument('--resume', type=int, default=resume, help='-2:best;-1:latest.ptb; 0:pretrain; >0: resume')
     parser.add_argument('--save', type=str, default=savepath, help='f% (SwinIR, testset),')
     parser.add_argument('--pre_train', type=str, default=modelpath)
+    parser.add_argument('--prune', action='store_true', help='prune layers')
 
     # Data specifications
     parser.add_argument('--data_test', type=str, default=testset, help='demo image directory')
@@ -115,6 +116,13 @@ def options():
 
 def main():
     _model = model.Model(args, checkpoint)
+
+    if args.prune:
+        prune_layers = 1
+        rstb_layers = len(_model.model.layers)
+        print("Total Layers:",rstb_layers,"Prune Layers:",prune_layers)
+        del _model.model.layers[prune_layers]
+
     # global model
     if not args.test_only:
         loader_train = dataloader.DataLoader(

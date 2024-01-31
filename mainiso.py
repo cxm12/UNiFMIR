@@ -16,6 +16,7 @@ def options():
                         help='set this option to test the model')
     parser.add_argument('--modelpath', type=str, default=modelpath, help='ENLCAx4.pt  pre-trained model directory')
     parser.add_argument('--task', type=int, default=3)
+    parser.add_argument('--prune', action='store_true', help='prune layers')
 
     parser.add_argument('--inputchannel', type=int, default=1, help='')
     scale = 1
@@ -136,6 +137,13 @@ def main():
         loader_train = None
         
     _model = model.Model(args, checkpoint)
+
+    if args.prune:
+        prune_layers = 1
+        rstb_layers = len(_model.model.layers)
+        print("Total Layers:",rstb_layers,"Prune Layers:",prune_layers)
+        del _model.model.layers[prune_layers]
+
     _loss = loss.Loss(args, checkpoint) if not args.test_only else None
     t = Trainer(args, loader_train, loader_test, args.data_test, _model, _loss, checkpoint)
 
