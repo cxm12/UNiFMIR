@@ -1,4 +1,4 @@
-basicsr          ==          1.4.2
+# basicsr          ==          1.4.2 
 easydict         ==          1.10
 imageio          ==          2.13.3
 keras            ==          2.7.0
