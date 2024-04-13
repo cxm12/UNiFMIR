@@ -689,8 +689,6 @@ with gr.Blocks() as demo:
                 output_message = gr.Textbox(label="Output Information", value="Image not loaded")
                 display_btn = gr.Button("Check Output")
 
-    gr.Markdown("Internet Content Provider ID: [沪ICP备2023024810号-1](https://beian.miit.gov.cn/)", rtl=True)
-
     check_input.click(visualize, inputs=img_input, outputs=[img_visual, input_message], queue=True)
     display_btn.click(visualize, inputs=output_file, outputs=[img_output, output_message], queue=True)
     load_btn.click(load_model,inputs=[type, device, chop, quantization, skip],outputs=load_progress, queue=True)
