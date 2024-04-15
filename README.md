@@ -1,5 +1,5 @@
 # UniFMIR
-Pre-training a Foundation Model for Universal Fluorescence Microscopy Image Restoration
+Official Implementation for "Pretraining a foundation model for generalizable fluorescence microscopy-based image restoration"
 
 ## Online Demo
 
@@ -130,3 +130,19 @@ CUDA_VISIBLE_DEVICES=0,1 python maindenoise.py --precision half --n_GPUs 2
 ## Train UniFMIR
 
 Please refer to the [pretrain branch](https://github.com/cxm12/UNiFMIR/tree/pretrain#readme) for training UniFMIR from scratch.
+
+
+## CITATION
+
+If you use this code for your research, please cite our paper.
+
+```bibtex
+@article{ma2024pretraining,
+  title={Pretraining a foundation model for generalizable fluorescence microscopy-based image restoration},
+  author={Ma, Chenxi and Tan, Weimin and He, Ruian and Yan, Bo},
+  journal={Nature Methods},
+  pages={1--10},
+  year={2024},
+  publisher={Nature Publishing Group US New York}
+}
+```
