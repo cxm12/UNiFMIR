@@ -3,7 +3,7 @@ Official Implementation for "Pretraining a foundation model for generalizable fl
 
 ## Online Demo
 
-We provide a live demo for UniFMIR at [http://unifmir.fdudml.cn/](http://unifmir.fdudml.cn/). You can also use the colab <a target="_blank" href="https://colab.research.google.com/github/cxm12/UNiFMIR/blob/main/UniFMIR.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a> or employ the following steps to run the demo locally.
+We provide a live demo for UniFMIR at [http://unifmir.fdudml.cn/](http://unifmir.fdudml.cn/). You can also use the colab <a target="_blank" href="https://colab.research.google.com/github/cxm12/UNiFMIR/blob/main/UniFMIR.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>, the openxlab app [![Open in OpenXLab](https://cdn-static.openxlab.org.cn/app-center/openxlab_app.svg)](https://openxlab.org.cn/apps/detail/ryanhe312/UniFMIR) or employ the following steps to run the demo locally.
 
 ![demo](./demo.jpg)
 
